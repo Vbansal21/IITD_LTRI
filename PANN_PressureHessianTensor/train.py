@@ -67,11 +67,18 @@ def eig_desc(tensor_batch: np.ndarray):
     vecs = vecs[rows, :, idx]
     return vals, vecs                                     # (N,3), (N,3,3)
 
-def vieillefosse_curve(n_pts: int = 300):
-    qv = np.linspace(-1, 1, n_pts)
-    rv = (2.0 / 3.0) * np.sqrt(3) * np.abs(qv) ** 1.5
-    msk = qv <= 0
-    return qv[msk], +rv[msk], -rv[msk]
+# [VF-GLB-01] Correct Vieillefosse curve for invariants (q,r) of A (no extra √3)
+def vieillefosse_curve(n_pts: int = 600, qmin: float = -1.0, qmax: float = 0.0):
+    """
+    Returns (qv, +rv, -rv) for the Vieillefosse tail in the (q,r) invariants:
+        (27/4) r^2 + q^3 = 0  ⇒  r = ± (2/3) (-q)^{3/2},  q ≤ 0.
+    q is on the Y-axis, r on the X-axis in your figures.
+    """
+    q_hi = min(0.0, float(qmax))
+    q_lo = float(min(qmin, q_hi))
+    qv = np.linspace(q_lo, q_hi, n_pts)
+    rv = (2.0 / 3.0) * np.power(-qv, 1.5)  # ← no √3 factor
+    return qv, +rv, -rv
 
 def hexbin_with_mean(ax, x, y, c, gridsize=200, vmin=None, vmax=None):
     return ax.hexbin(
@@ -407,39 +414,65 @@ class AIBMTrainer:
     def plot_history(self, save_dir=None):
         df = pd.DataFrame(self.history)
         epochs = df['epoch']
-        def add_best_ema(ax, arr, label, c, ylbl=None):
-            arr = np.asarray(arr)
-            ax.plot(epochs, arr, c, label=label, lw=2, marker='o', ms=4)
-            ax.plot(epochs, ema(arr, self.ema_alpha), c+'--', lw=2, label=label+" EMA")
-            min_ix = np.argmin(arr)
-            ax.axhline(np.min(arr), c=c, lw=1.2, ls=':', alpha=0.5)
-            ax.plot(epochs[min_ix], arr[min_ix], marker='*', c=c, ms=14, mec='k', mew=1.5, label=label+' Best')
+        
+        def add_best_ema(ax, train_arr, val_arr, label, train_c, val_c, ylbl=None):
+            train_arr = np.asarray(train_arr)
+            val_arr = np.asarray(val_arr)
+            
+            # Plot training metrics
+            ax.plot(epochs, train_arr, train_c, label=f"Train {label}", lw=2, marker='o', ms=4)
+            ax.plot(epochs, ema(train_arr, self.ema_alpha), train_c+'--', lw=2, label=f"Train {label} EMA")
+            
+            # Plot validation metrics
+            ax.plot(epochs, val_arr, val_c, label=f"Val {label}", lw=2, marker='s', ms=4)
+            ax.plot(epochs, ema(val_arr, self.ema_alpha), val_c+'--', lw=2, label=f"Val {label} EMA")
+            
+            # Add best validation point
+            min_ix = np.argmin(val_arr)
+            ax.axhline(np.min(val_arr), c=val_c, lw=1.2, ls=':', alpha=0.5)
+            ax.plot(epochs[min_ix], val_arr[min_ix], marker='*', c=val_c, ms=14, mec='k', mew=1.5, label=f"Val {label} Best")
+            
             if ylbl: ax.set_ylabel(ylbl)
+        
         fig, axs = plt.subplots(2, 2, figsize=(16, 11))
+        
         # Euler angle and L1/L2/L3
-        add_best_ema(axs[0,0], df['val_euler'], "Val Euler(Q)", 'C0', "Euler Angle Loss")
-        axs[0,0].plot(epochs, df['val_L1'], 'g-', lw=1.3, label="L1")
-        axs[0,0].plot(epochs, df['val_L2'], 'b-', lw=1.3, label="L2")
-        axs[0,0].plot(epochs, df['val_L3'], 'r-', lw=1.3, label="L3")
+        add_best_ema(axs[0,0], df['train_euler'], df['val_euler'], "Euler(Q)", 'C0', 'C1', "Euler Angle Loss")
+        axs[0,0].plot(epochs, df['train_L1'], 'g-', lw=1.3, label="Train L1", alpha=0.7)
+        axs[0,0].plot(epochs, df['val_L1'], 'g-', lw=1.3, label="Val L1")
+        axs[0,0].plot(epochs, df['train_L2'], 'b-', lw=1.3, label="Train L2", alpha=0.7)
+        axs[0,0].plot(epochs, df['val_L2'], 'b-', lw=1.3, label="Val L2")
+        axs[0,0].plot(epochs, df['train_L3'], 'r-', lw=1.3, label="Train L3", alpha=0.7)
+        axs[0,0].plot(epochs, df['val_L3'], 'r-', lw=1.3, label="Val L3")
         axs[0,0].legend()
+        
         # Psi RMSE and R2
-        add_best_ema(axs[0,1], df['val_psi_rmse'], "Val Psi RMSE", 'C1', "Psi RMSE")
-        axs[0,1].plot(epochs, df['val_psi_r2'], 'C3--', lw=1.2, label="Psi R²")
+        add_best_ema(axs[0,1], df['train_psi_rmse'], df['val_psi_rmse'], "Psi RMSE", 'C2', 'C3', "Psi RMSE")
+        axs[0,1].plot(epochs, df['train_psi_r2'], 'C4--', lw=1.2, label="Train Psi R²", alpha=0.7)
+        axs[0,1].plot(epochs, df['val_psi_r2'], 'C5--', lw=1.2, label="Val Psi R²")
         axs[0,1].legend()
+        
         # Q RMSE and Hessian
-        add_best_ema(axs[1,0], df['val_Q_rmse'], "Q RMSE", 'C4', "Q RMSE")
-        axs[1,0].plot(epochs, df['val_hess_rmse'], 'C5-', lw=1.3, label="Hessian λ_max")
+        add_best_ema(axs[1,0], df['train_Q_rmse'], df['val_Q_rmse'], "Q RMSE", 'C6', 'C7', "Q RMSE")
+        axs[1,0].plot(epochs, df['train_hess_rmse'], 'C8-', lw=1.3, label="Train Hessian λ_max", alpha=0.7)
+        axs[1,0].plot(epochs, df['val_hess_rmse'], 'C9-', lw=1.3, label="Val Hessian λ_max")
         axs[1,0].legend()
+        
         # Symmetry loss, logcosh, mse
-        add_best_ema(axs[1,1], df['val_symm'], "Val Symmetry", 'C2', "Symmetry Loss")
-        axs[1,1].plot(epochs, df['val_psi_logcosh'], 'C6-', lw=1.3, label="Psi LogCosh")
-        axs[1,1].plot(epochs, df['val_psi_mse'], 'C7-', lw=1.3, label="Psi MSE")
+        add_best_ema(axs[1,1], df['train_symm'], df['val_symm'], "Symmetry", 'C10', 'C11', "Symmetry Loss")
+        axs[1,1].plot(epochs, df['train_psi_logcosh'], 'C12-', lw=1.3, label="Train Psi LogCosh", alpha=0.7)
+        axs[1,1].plot(epochs, df['val_psi_logcosh'], 'C13-', lw=1.3, label="Val Psi LogCosh")
+        axs[1,1].plot(epochs, df['train_psi_mse'], 'C14-', lw=1.3, label="Train Psi MSE", alpha=0.7)
+        axs[1,1].plot(epochs, df['val_psi_mse'], 'C15-', lw=1.3, label="Val Psi MSE")
         axs[1,1].legend()
+        
         for ax in axs.flat:
             ax.set_xlabel('Epoch')
             ax.grid(True, ls=':', alpha=0.6)
+        
         fig.suptitle("AIBM Training & Validation Metrics", fontsize=16)
         plt.tight_layout(rect=[0,0,1,0.97])
+        
         if save_dir:
             plt.savefig(f"{save_dir}/training_metrics_full.png", dpi=300)
         plt.show()
@@ -484,349 +517,517 @@ class AIBMTrainer:
 
 class AIBMVisualizer:
     """
-    End-to-end diagnostic plots for the AIBM pressure-Hessian model.
-    Call `plot_all()` after instantiation.
+    Visual diagnostics for AIBM with DNS baselines and DNS-vs-Model overlays.
+
+    Conventions
+    -----------
+    • (x, y) = (r, q) on all (q,r) plots
+    • Vieillefosse tail (correct scaling):
+          27 r^2 + 4 q^3 = 0  ⇒  r = ± (2/3) (-q)^{3/2},  q ≤ 0
+    • Eigen-order used for labeling is ASCENDING (γ, β, α) = (λ_min, λ_mid, λ_max)
+      to match the paper’s notation and the training loss utilities.
+    • s–Q′ grid panel order (exact):
+        Row 1: γ_s·γ_p, γ_s·β_p, γ_s·α_p
+        Row 2: β_s·γ_p, β_s·β_p, β_s·α_p
+        Row 3: α_s·γ_p, α_s·β_p, α_s·α_p
+      Vorticity vs Q′ (left→right): γ_p·ω, β_p·ω, α_p·ω
+    • Figures saved at 600 DPI with 01–07 prefixes.
     """
-    def __init__(self,
-                model_Q: torch.nn.Module,
-                model_psi: torch.nn.Module,
-                data_generator,
-                run_dir: str | Path = "figs/run_vis"):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.run_dir = Path(run_dir)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        # ––––– DNS tensors –––––
-        self.A_full, self.Q_full = data_generator.get_full_dataset()  # torch tensors
-        self.A_full = self.A_full.to(self.device)
-        self.Q_full = self.Q_full.to(self.device)
+    DPI = 600
 
-        # Velocity-gradient decomposition
-        self.s, self.w, self.eps, self.q, self.r = get_tensor_derivatives(self.A_full)
-        self.Qp, self.Qhp, self.psi_true = process_ground_truth_Q(self.Q_full, self.eps)
+    # ------------------------------------------------------------------ #
+    # Init / prepare
+    # ------------------------------------------------------------------ #
+    def __init__(self, model_Q, model_psi, dataset,
+                 save_dir: str | Path | None = None,
+                 max_samples: int | None = 300_000,
+                 seed: int = 42):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.mQ = model_Q.to(self.device).eval()
+        self.mP = model_psi.to(self.device).eval()
+        self.dataset = dataset
+        self.max_samples = max_samples
+        self.rng = np.random.default_rng(seed)
 
-        # Normalise A for model input
-        a = self.A_full / self.eps.unsqueeze(-1).unsqueeze(-1)
-        self.s_norm = 0.5 * (a + a.transpose(1, 2))
+        if save_dir is None:
+            save_dir = str(globals().get('RUN_DIR', Path('figs') / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"))
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # ––––– Model predictions –––––
-        self.model_Q = model_Q.to(self.device).eval()
-        self.model_psi = model_psi.to(self.device).eval()
+        self._prepared = False
+
+    def _prepare(self):
+        if self._prepared:
+            return
+
+        A, Q = self.dataset.get_full_dataset()
+        if self.max_samples is not None and len(A) > self.max_samples:
+            idx = torch.from_numpy(self.rng.choice(len(A), size=self.max_samples, replace=False))
+            A, Q = A[idx], Q[idx]
+
+        A = A.to(self.device).float()
+        Q = Q.to(self.device).float()
+
         with torch.no_grad():
-            self.Qhp_pred, _ = self.model_Q(self.s_norm, self.w)
-            self.psi_pred = self.model_psi(self.q, self.r)
+            s, w, eps, q, r = get_tensor_derivatives(A)
+            a = A / eps.view(-1, 1, 1)
+            s_norm = 0.5 * (a + a.transpose(1, 2))
 
-        # Move to cpu-numpy for plotting
-        self._to_numpy()
+            # DNS processing
+            Qp_true, Qhat_true, psi_true = process_ground_truth_Q(Q, eps)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Public API
-    # ──────────────────────────────────────────────────────────────────────
-    def plot_all(self):
-        """Create every figure (7 total)."""
-        # self.plot_psi_contour_on_qr()
-        # self.plot_qr_joint_pdf()
-        self.plot_invariant_ratios()
-        # self.plot_eigenvector_alignment_s_Q()
-        # self.plot_eigenvector_alignment_vorticity_Q()
-        # self.plot_psi_pdf()
-        # self.plot_phi_vs_q_epsilon_sq()
+            # Model predictions
+            Qhat_pred, _ = self.mQ(s_norm, w)
+            psi_pred = self.mP(q, r)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Individual panels
-    # ──────────────────────────────────────────────────────────────────────
-    # 1 – ψ(q,r) contour with Vieillefosse tail
-    def plot_psi_contour_on_qr(self, show: bool = False):
-        
-        print("Generating psi contours of < psi | q,r >")
+        self.A, self.Q = A, Q
+        self.s_norm, self.w, self.eps, self.q, self.r = s_norm, w, eps, q, r
+        self.Qp_true, self.Qhat_true, self.psi_true = Qp_true, Qhat_true, psi_true
+        self.Qhat_pred, self.psi_pred = Qhat_pred, psi_pred
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        h = hexbin_with_mean(
-            ax, self.r_np, self.q_np,
-            np.clip(self.psi_true_np, 0, 2),
-            vmin=0, vmax=2
-        )
-        cb = fig.colorbar(h, ax=ax)
-        cb.set_label(r"$\langle \psi \mid q,r \rangle$")
-        self._format_qr_axes(ax)
-        # Vieillefosse
-        qv, rv_p, rv_m = vieillefosse_curve()
-        ax.plot(rv_p, qv, 'r--', lw=1.5)
-        ax.plot(rv_m, qv, 'r--', lw=1.5)
-        fig.savefig(self.run_dir / "fig_psi_contour_qr.png")
-        if show: plt.show()
-        plt.close(fig)
+        to_np = lambda t: t.detach().cpu().numpy().astype(np.float64)
+        self.q_np, self.r_np, self.eps_np = to_np(q), to_np(r), to_np(eps)
+        self.psi_true_np, self.psi_pred_np = to_np(psi_true), to_np(psi_pred)
+        self.Qhat_true_np, self.Qhat_pred_np = to_np(Qhat_true), to_np(Qhat_pred)
 
-    # 2 – joint PDF of (q,r)
-    def plot_qr_joint_pdf(self, show: bool = False):
+        # Dimensional Q (for rotation + φ)
+        self.Q_true_np = self.Qhat_true_np * self.psi_true_np[:, None, None] * (self.eps_np[:, None, None] ** 2)
+        self.Q_pred_np = self.Qhat_pred_np * self.psi_pred_np[:, None, None] * (self.eps_np[:, None, None] ** 2)
 
-        print("Generating joint-PDf of (q,r)")
+        # φ vs qε²
+        self.X_qe2_np = self.q_np * (self.eps_np ** 2)
+        self.Y_true_np = (self.psi_true_np ** 2) * (self.eps_np ** 4)
+        self.Y_pred_np = (self.psi_pred_np ** 2) * (self.eps_np ** 4)
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        sns.kdeplot(
-            x=self.r_np, y=self.q_np, fill=True,
-            cmap="mako", levels=100, bw_adjust=0.3,
-            clip=[[-1, 1], [-1, 1]], ax=ax
-        )
-        self._format_qr_axes(ax)
-        qv, rv_p, rv_m = vieillefosse_curve()
-        ax.plot(rv_p, qv, 'r--', lw=1.3)
-        ax.plot(rv_m, qv, 'r--', lw=1.3)
-        fig.savefig(self.run_dir / "fig_qr_pdf.png")
-        if show: plt.show()
-        plt.close(fig)
+        self._prepared = True
 
-    # 3 – Invariant–ratio PDFs (DNS & model)
-    def plot_invariant_ratios(self, show: bool = False):
+    # ------------------------------------------------------------------ #
+    # Utilities
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _eig_asc(M: np.ndarray):
+        """Eigenpairs in ASCENDING order (γ, β, α) to match paper notation."""
+        vals, vecs = np.linalg.eigh(M)  # ascending already
+        return vals, vecs  # vecs[..., i] is eigenvector i (γ=0, β=1, α=2)
+
+    @staticmethod
+    def _unit_rows(X: np.ndarray, eps: float = 1e-12):
+        n = np.linalg.norm(X, axis=1, keepdims=True)
+        return X / (n + eps)
+
+    @staticmethod
+    def _omega_from_w(w_np: np.ndarray):
+        # ω = [w32 - w23, w13 - w31, w21 - w12]
+        wx = w_np[:, 2, 1] - w_np[:, 1, 2]
+        wy = w_np[:, 0, 2] - w_np[:, 2, 0]
+        wz = w_np[:, 1, 0] - w_np[:, 0, 1]
+        return AIBMVisualizer._unit_rows(np.stack([wx, wy, wz], axis=1))
+
+    @staticmethod
+    def _rot_z(theta_deg: float):
+        t = np.deg2rad(theta_deg)
+        c, s = np.cos(t), np.sin(t)
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    @staticmethod
+    def _rotate_batch(M: np.ndarray, R: np.ndarray):
+        Rt = R.T
+        return np.einsum('ij,njk,kl->nil', R, M, Rt, optimize=True)
+
+    @staticmethod
+    def _vieillefosse(qmin: float, qmax: float, n: int = 800):
         """
-        PDFs of F1, F2, F3 defined in Eq. (37) of the paper.
-        For a rotation-invariant model the distributions collapse to δ(Fk-1).
+        Vieillefosse tail in (q,r) invariants:
+            27 r^2 + 4 q^3 = 0  (q ≤ 0)  ⇒  r = ± sqrt( -(4/27) q^3 )
+        Returns (q_grid<=0, +r(q), -r(q)) for plotting with x=r, y=q.
+        Uses sqrt form to avoid (-q)^{3/2} fp traps near q≈0⁻.
         """
+        q_hi = min(0.0, float(qmax))
+        q_lo = float(min(qmin, q_hi))
+        qv = np.linspace(q_lo, q_hi, n)
+        rv = np.sqrt(np.maximum(-(4.0/27.0) * (qv ** 3), 0.0))
+        return qv, +rv, -rv
 
-        print("Generating PDFs of invariant ratios F1,F2,F3")
- 
-        # 30° rotation about z
-        R = self._rotation_matrix_z(np.pi / 6).to(self.device)
+    def _hexbin_mean(self, ax, x, y, c, gridsize=220, vmin=None, vmax=None):
+        return ax.hexbin(x, y, C=c, gridsize=gridsize, reduce_C_function=np.mean,
+                         cmap='viridis', linewidths=0.1, vmin=vmin, vmax=vmax)
 
-        # Helper: invariants from eigenvalues
-        def invariants(eig):                           # eig: (N,3)
-            I1 = eig.sum(1)
-            I2 = eig[:,0]*eig[:,1] + eig[:,1]*eig[:,2] + eig[:,0]*eig[:,2]
-            I3 = eig.prod(1)
-            return I1, I2, I3
+    def _pdf_curve(self, x, bins=140, clip=None):
+        x = np.asarray(x).reshape(-1)
+        if clip is not None:
+            x = x[(x >= clip[0]) & (x <= clip[1])]
+        if len(x) == 0:
+            grid = np.linspace(0, 1, bins)
+            return grid, np.zeros_like(grid)
+        h, e = np.histogram(x, bins=bins, density=True)
+        xc = 0.5 * (e[:-1] + e[1:])
+        return xc, h
 
-        # ─── DNS ──────────────────────────────────────────────────────────
-        Q_dns      = self.Qp                                # (N,3,3)
-        Q_dns_rot  = torch.einsum('ik,bkl,jl->bij', R, Q_dns, R)
-        eig_dns,   eig_dns_r   = map(np.linalg.eigvalsh,
-                                     (Q_dns.cpu().numpy(),
-                                      Q_dns_rot.cpu().numpy()))
-        I1, I2, I3       = invariants(eig_dns)
-        I1r, I2r, I3r    = invariants(eig_dns_r)
-        F1_dns = I1r/I1;  F2_dns = I2r/I2;  F3_dns = I3r/I3
+    # ------------------------------------------------------------------ #
+    # 1) ψ(q,r) — separate DNS and AIBM (no overlay) + legends/colorbars
+    # ------------------------------------------------------------------ #
+    def fig_01_psi_qr(self):
+        self._prepare()
+        q, r = self.q_np, self.r_np
+        vmin, vmax = 0.0, float(np.percentile(np.concatenate([self.psi_true_np, self.psi_pred_np]), 99.5))
 
-        # ─── AIBM ────────────────────────────────────────────────────────
-        # original prediction (dimensional)
-        Q_pred_dim = self.Qhp_pred * self.psi_pred[:,None,None]
-        # rotated inputs
-        A_rot      = torch.einsum('ik,bkl,jl->bij', R, self.A_full, R)
-        s_rot, w_rot, eps_rot, q_rot, r_rot = get_tensor_derivatives(A_rot)
-        a_rot   = A_rot / eps_rot[:,None,None]
-        s_rot_n = 0.5*(a_rot + a_rot.transpose(1,2))
+        # DNS
+        fig, ax = plt.subplots(figsize=(6.6, 5.6))
+        hb = self._hexbin_mean(ax, r, q, self.psi_true_np, vmin=vmin, vmax=vmax)
+        qv, rp, rm = self._vieillefosse(q.min(), q.max())
+        ax.plot(rp, qv, 'w--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'w--', lw=1.1)
+        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title(r'DNS: $\psi(q,r)$'); ax.grid(True, ls=':', alpha=0.45)
+        cb = fig.colorbar(hb, ax=ax, pad=0.01); cb.set_label(r'$\langle \psi \rangle$')
+        ax.legend(loc='upper left')
+        fig.savefig(self.save_dir / '01A_psi_qr_dns.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+        # AIBM
+        fig, ax = plt.subplots(figsize=(6.6, 5.6))
+        hb = self._hexbin_mean(ax, r, q, self.psi_pred_np, vmin=vmin, vmax=vmax)
+        qv, rp, rm = self._vieillefosse(q.min(), q.max())
+        ax.plot(rp, qv, 'w--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'w--', lw=1.1)
+        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title(r'AIBM: $\psi(q,r)$'); ax.grid(True, ls=':', alpha=0.45)
+        cb = fig.colorbar(hb, ax=ax, pad=0.01); cb.set_label(r'$\langle \psi \rangle$')
+        ax.legend(loc='upper left')
+        fig.savefig(self.save_dir / '01B_psi_qr_aibm.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+    # ------------------------------------------------------------------ #
+    # 2) Joint PDF of (q,r) — separate DNS and AIBM, with colorbars
+    # ------------------------------------------------------------------ #
+    def fig_02_qr_pdf(self):
+        self._prepare()
+        q, r = self.q_np, self.r_np
+
+        # DNS
+        fig, ax = plt.subplots(figsize=(6.6, 5.6))
+        kde = sns.kdeplot(x=r, y=q, fill=True, levels=40, thresh=1e-4, ax=ax, cmap='viridis')
+        if getattr(kde, "collections", None):
+            fig.colorbar(kde.collections[0], ax=ax, pad=0.01, label='PDF (a.u.)')
+        qv, rp, rm = self._vieillefosse(q.min(), q.max())
+        ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
+        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('DNS: joint PDF in $(q,r)$')
+        ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
+        fig.savefig(self.save_dir / '02A_qr_pdf_dns.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+        # AIBM (same (q,r) cloud; still shown separately)
+        fig, ax = plt.subplots(figsize=(6.6, 5.6))
+        kde = sns.kdeplot(x=r, y=q, fill=True, levels=40, thresh=1e-4, ax=ax, cmap='mako')
+        if getattr(kde, "collections", None):
+            fig.colorbar(kde.collections[0], ax=ax, pad=0.01, label='PDF (a.u.)')
+        qv, rp, rm = self._vieillefosse(q.min(), q.max())
+        ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
+        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('AIBM: joint PDF in $(q,r)$')
+        ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
+        fig.savefig(self.save_dir / '02B_qr_pdf_aibm.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+    # ------------------------------------------------------------------ #
+    # 3) Rotation-invariance (A: DNS, B: overlay)
+    # ------------------------------------------------------------------ #
+    def fig_03_rotation_invariance(self, theta_deg: float = 30.0):
+        self._prepare()
+        R = self._rot_z(theta_deg)
+
+        # DNS tensors and rotated
+        Q_dns = self.Q_true_np
+        Q_dns_rot = self._rotate_batch(Q_dns, R)
+
+        # Model tensors (recompute on rotated A)
+        A_np = self.A.detach().cpu().numpy().astype(np.float64)
+        A_rot_np = self._rotate_batch(A_np, R)
         with torch.no_grad():
-            Qhat_rot,_ = self.model_Q(s_rot_n, w_rot)
-            psi_rot    = self.model_psi(q_rot, r_rot)
-        Q_pred_dim_rot = Qhat_rot * psi_rot[:,None,None]
+            A_rot = torch.from_numpy(A_rot_np).to(self.device, dtype=self.A.dtype)
+            s_r, w_r, eps_r, q_r, r_r = get_tensor_derivatives(A_rot)
+            a_r = A_rot / eps_r.view(-1, 1, 1)
+            s_norm_r = 0.5 * (a_r + a_r.transpose(1, 2))
+            Qhat_r, _ = self.mQ(s_norm_r, w_r)
+            psi_r = self.mP(q_r, r_r)
+        Q_mod = self.Q_pred_np
+        Q_mod_rot = Qhat_r.detach().cpu().numpy().astype(np.float64) * \
+                    psi_r.detach().cpu().numpy()[:, None, None] * \
+                    (eps_r.detach().cpu().numpy()[:, None, None] ** 2)
 
-        eig_pred, eig_pred_r = map(np.linalg.eigvalsh,
-                                   (Q_pred_dim.cpu().numpy(),
-                                    Q_pred_dim_rot.cpu().numpy()))
-        I1p, I2p, I3p    = invariants(eig_pred)
-        I1pr, I2pr, I3pr = invariants(eig_pred_r)
-        F1_pred = I1pr/I1p;  F2_pred = I2pr/I2p;  F3_pred = I3pr/I3p
+        def ratios(Qa, Qb):
+            lam_a, _ = self._eig_asc(Qa)
+            lam_b, _ = self._eig_asc(Qb)
+            return np.abs(lam_b / np.maximum(np.abs(lam_a), 1e-12))  # columns: [γ,β,α]
 
-        # ─── Plot ────────────────────────────────────────────────────────
-        fig, axes = plt.subplots(1, 3, figsize=(18,5))
-        for k,(Fd,Fp,title) in enumerate(zip(
-                [F1_dns, F2_dns, F3_dns],
-                [F1_pred, F2_pred, F3_pred],
-                [r"$F_1 = I_1'/I_1$", r"$F_2 = I_2'/I_2$", r"$F_3 = I_3'/I_3$"])):
-            ax = axes[k]
-            sns.kdeplot(Fd, ax=ax, label="DNS",  lw=1)
-            sns.kdeplot(Fp, ax=ax, label="AIBM", lw=1.25, ls='--')
-            # ax.axvline(1, c='grey', ls=':')
-            ax.set_xlim(([(-4, 4), (0.99, 1.01), (0.85, 1.05)])[k])      # loose bounds; adjust if needed
-            if k==2: ax.set_yscale('log')
-            ax.set_xlabel(title)
-            ax.set_ylabel("PDF")
-            ax.grid(ls=':', alpha=0.7)
-            if k==2: ax.legend()
-        fig.suptitle("Rotation-invariance check via invariant ratios", fontsize=12)
-        fig.savefig(self.run_dir / "fig_invariant_ratios.png", dpi=1200)
-        if show: plt.show()
-        plt.close(fig)
+        F_dns = ratios(Q_dns, Q_dns_rot)
+        F_mod = ratios(Q_mod, Q_mod_rot)
 
+        titles = [r"$|\lambda'_\gamma|/|\lambda_\gamma|$",
+                  r"$|\lambda'_\beta|/|\lambda_\beta|$",
+                  r"$|\lambda'_\alpha|/|\lambda_\alpha|$"]
 
-    # 4 – |cos (s ↔ Q′)| PDFs (9 panels)
-    def plot_eigenvector_alignment_s_Q(self, show: bool = False):
+        # DNS only
+        fig, axs = plt.subplots(1, 3, figsize=(13.2, 4.1), constrained_layout=True)
+        for k in range(3):
+            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS")
+            axs[k].set_title(titles[k]); axs[k].set_xlabel("Ratio"); axs[k].grid(True, ls=':', alpha=0.45)
+            axs[k].set_yscale('log')
+        axs[0].legend()
+        fig.savefig(self.save_dir / '03A_rotation_invariance_dns.png', dpi=self.DPI); plt.close(fig)
 
-        print("Generating PDFs of cosine-angles dotted of s with Q'")
-        _, vec_s = eig_desc(self.s_np)
-        _, vec_q_dns = eig_desc(self.Qhp_np)
-        _, vec_q_pred = eig_desc(self.Qhp_pred_np)
+        # DNS vs AIBM overlay
+        fig, axs = plt.subplots(1, 3, figsize=(13.2, 4.1), constrained_layout=True)
+        for k in range(3):
+            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS")
+            sns.kdeplot(F_mod[:, k], ax=axs[k], bw_adjust=0.9, color="C1", lw=1.8, label="AIBM")
+            axs[k].set_title(titles[k]); axs[k].set_xlabel("Ratio"); axs[k].grid(True, ls=':', alpha=0.45)
+            axs[k].set_yscale('log')
+        axs[0].legend()
+        fig.savefig(self.save_dir / '03B_rotation_invariance_overlay.png', dpi=self.DPI); plt.close(fig)
 
-        labels_s = [r"$\hat{e}_{\gamma_s}$",
-                    r"$\hat{e}_{\beta_s}$",
-                    r"$\hat{e}_{\alpha_s}$"]
-        labels_p = [r"$\hat{e}_{\gamma_{Q'}}$",
-                    r"$\hat{e}_{\beta_{Q'}}$",
-                    r"$\hat{e}_{\alpha_{Q'}}$"]
+    # ------------------------------------------------------------------ #
+    # 4) Orientation: s vs Q′ — exact panel order, ASC eigen ordering
+    # ------------------------------------------------------------------ #
+    def fig_04_s_vs_Q(self):
+        self._prepare()
+        s_np = self.s_norm.detach().cpu().numpy().astype(np.float64)
+        _, Vs = self._eig_asc(s_np)
+        _, Vt = self._eig_asc(self.Qhat_true_np)
+        _, Vp = self._eig_asc(self.Qhat_pred_np)
+        # γ,β,α indices = 0,1,2
+        s_e = [Vs[:, :, 0], Vs[:, :, 1], Vs[:, :, 2]]  # [γ_s, β_s, α_s]
+        t_e = [Vt[:, :, 0], Vt[:, :, 1], Vt[:, :, 2]]  # [γ_p, β_p, α_p]
+        p_e = [Vp[:, :, 0], Vp[:, :, 1], Vp[:, :, 2]]  # [γ_p, β_p, α_p]
 
-        fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+        def cosabs(U, V):
+            U = self._unit_rows(U); V = self._unit_rows(V)
+            return np.clip(np.abs(np.sum(U * V, axis=1)), 0.0, 1.0)
+
+        labels = [[r'$\hat e_{\gamma_s}\!\cdot\!\hat e_{\gamma_p}$',
+                   r'$\hat e_{\gamma_s}\!\cdot\!\hat e_{\beta_p}$',
+                   r'$\hat e_{\gamma_s}\!\cdot\!\hat e_{\alpha_p}$'],
+                  [r'$\hat e_{\beta_s}\!\cdot\!\hat e_{\gamma_p}$',
+                   r'$\hat e_{\beta_s}\!\cdot\!\hat e_{\beta_p}$',
+                   r'$\hat e_{\beta_s}\!\cdot\!\hat e_{\alpha_p}$'],
+                  [r'$\hat e_{\alpha_s}\!\cdot\!\hat e_{\gamma_p}$',
+                   r'$\hat e_{\alpha_s}\!\cdot\!\hat e_{\beta_p}$',
+                   r'$\hat e_{\alpha_s}\!\cdot\!\hat e_{\alpha_p}$']]
+
+        # DNS only
+        fig, axs = plt.subplots(3, 3, figsize=(12.6, 10.6), constrained_layout=True)
         for i in range(3):
             for j in range(3):
-                c_dns  = self._abs_cos(vec_s[:, :, i], vec_q_dns[:, :, j])
-                c_pred = self._abs_cos(vec_s[:, :, i], vec_q_pred[:, :, j])
-                ax = axes[i, j]
-                sns.kdeplot(c_dns,  ax=ax, label="DNS",   lw=2,
-                            bw_adjust=0.4, clip=(0, 1))
-                sns.kdeplot(c_pred, ax=ax, label="AIBM", linestyle='--', lw=2,
-                            bw_adjust=0.4, clip=(0, 1))
-                ax.set_xlim(0, 1)
-                ax.set_ylim(0, 2)
-                ax.set_title(f"{labels_s[i]} vs {labels_p[j]}")
-                ax.axvline(1, ls=':', c='grey')
-                if i == 0 and j == 2:
-                    ax.legend()
-                ax.grid(ls=':', alpha=0.7)
-        fig.suptitle(r"PDFs of $|\,\cos(\theta_{s,Q'})|$", fontsize=16)
-        fig.savefig(self.run_dir / "fig_cos_s_Q.png")
-        if show: plt.show()
-        plt.close(fig)
+                xs, ys = self._pdf_curve(cosabs(s_e[i], t_e[j]), bins=120, clip=(0, 1))
+                ax = axs[i, j]
+                ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+                ax.set_xlim(0, 1); ax.set_xlabel('|cos θ|'); ax.set_ylabel('PDF')
+                ax.set_title(labels[i][j]); ax.grid(True, ls=':', alpha=0.5)
+        axs[0, 0].legend(loc='upper right')
+        fig.savefig(self.save_dir / '04A_sQ_align_dns.png', dpi=self.DPI); plt.close(fig)
 
-    # 5 – |cos (ω ↔ Q′)| PDFs (3 panels)
-    def plot_eigenvector_alignment_vorticity_Q(self, show: bool = False):
-
-        print("Generating PDFs of cosine-angles dotted of Q' with vorticity")
-        vort = self._vorticity_vector(self.w_np)
-        _, vec_q_dns = eig_desc(self.Qhp_np)
-        _, vec_q_pred = eig_desc(self.Qhp_pred_np)
-        labels = [r"$\hat{e}_{\gamma_{Q'}}$",
-                r"$\hat{e}_{\beta_{Q'}}$",
-                r"$\hat{e}_{\alpha_{Q'}}$"]
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        # DNS vs AIBM
+        fig, axs = plt.subplots(3, 3, figsize=(12.6, 10.6), constrained_layout=True)
         for i in range(3):
-            c_dns  = self._abs_cos(vort, vec_q_dns[:, :, i])
-            c_pred = self._abs_cos(vort, vec_q_pred[:, :, i])
-            ax = axes[i]
-            sns.kdeplot(c_dns,  ax=ax, lw=2, clip=(0, 1))
-            sns.kdeplot(c_pred, ax=ax, lw=2, linestyle='--', clip=(0, 1))
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 2)
-            ax.set_xlabel("Absolute cosine")
-            ax.set_title(f"ω · {labels[i]}")
-            ax.axvline(1, ls=':', c='grey')
-            if i == 2:
-                ax.legend(["DNS", "AIBM"])
-            ax.grid(ls=':', alpha=0.7)
-        fig.suptitle(r"PDFs of $|\,\cos(\theta_{\omega,Q'})|$", fontsize=16)
-        fig.savefig(self.run_dir / "fig_cos_w_Q.png")
-        if show: plt.show()
-        plt.close(fig)
+            for j in range(3):
+                ax = axs[i, j]
+                xs, ys = self._pdf_curve(cosabs(s_e[i], t_e[j]), bins=120, clip=(0, 1))
+                ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+                xs2, ys2 = self._pdf_curve(cosabs(s_e[i], p_e[j]), bins=120, clip=(0, 1))
+                ax.plot(xs2, ys2, 'C1--', lw=2, label='AIBM')
+                ax.set_xlim(0, 1); ax.set_xlabel('|cos θ|'); ax.set_ylabel('PDF')
+                ax.set_title(labels[i][j]); ax.grid(True, ls=':', alpha=0.5)
+        axs[0, 0].legend(loc='upper right')
+        fig.savefig(self.save_dir / '04B_sQ_align_overlay.png', dpi=self.DPI); plt.close(fig)
 
-    # 6 – ψ PDF
-    def plot_psi_pdf(self, show: bool = False):
+    # ------------------------------------------------------------------ #
+    # 5) Orientation: vorticity vs Q′ — order γ_p·ω, β_p·ω, α_p·ω
+    # ------------------------------------------------------------------ #
+    def fig_05_w_vs_Q(self):
+        self._prepare()
+        w_np = self.w.detach().cpu().numpy().astype(np.float64)
+        omg = self._omega_from_w(w_np)
+        _, Vt = self._eig_asc(self.Qhat_true_np)
+        _, Vp = self._eig_asc(self.Qhat_pred_np)
+        t_e = [Vt[:, :, 0], Vt[:, :, 1], Vt[:, :, 2]]
+        p_e = [Vp[:, :, 0], Vp[:, :, 1], Vp[:, :, 2]]
+        labels = [r'$\hat e_{\gamma_p}\!\cdot\!\hat\omega$',
+                  r'$\hat e_{\beta_p}\!\cdot\!\hat\omega$',
+                  r'$\hat e_{\alpha_p}\!\cdot\!\hat\omega$']
 
-        print("Generating PDF of psi's distribution")
-        fig, ax = plt.subplots(figsize=(7, 5))
-        sns.kdeplot(self.psi_true_np, ax=ax, lw=2,
-                    bw_adjust=0.4, clip=(0, 8), label="DNS")
-        sns.kdeplot(self.psi_pred_np, ax=ax, lw=2, linestyle='--',
-                    bw_adjust=0.4, clip=(0, 8), label="AIBM")
-        ax.set_xlim(0, 8)
-        ax.set_xlabel(r"$\psi$")
-        ax.set_ylabel("PDF")
-        ax.set_title(r"PDF of $\psi$")
-        ax.legend()
-        ax.grid(ls=':', alpha=0.7)
-        fig.savefig(self.run_dir / "fig_psi_pdf.png")
-        if show: plt.show()
-        plt.close(fig)
+        def cosabs(U, V):
+            U = self._unit_rows(U); V = self._unit_rows(V)
+            return np.clip(np.abs(np.sum(U * V, axis=1)), 0.0, 1.0)
 
-    # 7 – φ(qε²) relationship
-    def plot_phi_vs_q_epsilon_sq(self, show: bool = False):
+        # DNS only
+        fig, axs = plt.subplots(1, 3, figsize=(12.6, 4.0), constrained_layout=True)
+        for j in range(3):
+            xs, ys = self._pdf_curve(cosabs(omg, t_e[j]), bins=120, clip=(0, 1))
+            ax = axs[j]; ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+            ax.set_xlim(0, 1); ax.set_xlabel('|cos θ|'); ax.set_ylabel('PDF')
+            ax.set_title(labels[j]); ax.grid(True, ls=':', alpha=0.5)
+        axs[0].legend(loc='upper right')
+        fig.savefig(self.save_dir / '05A_wQ_align_dns.png', dpi=self.DPI); plt.close(fig)
 
-        print("Generating the phi v/s q-epsilone^2 graph")
-        qe2 = self.q_np * self.eps_np ** 2
-        msk = np.logical_and(qe2 >= -1, qe2 <= 1)
+        # DNS vs AIBM
+        fig, axs = plt.subplots(1, 3, figsize=(12.6, 4.0), constrained_layout=True)
+        for j in range(3):
+            ax = axs[j]
+            xs, ys = self._pdf_curve(cosabs(omg, t_e[j]), bins=120, clip=(0, 1))
+            ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+            xs2, ys2 = self._pdf_curve(cosabs(omg, p_e[j]), bins=120, clip=(0, 1))
+            ax.plot(xs2, ys2, 'C1--', lw=2, label='AIBM')
+            ax.set_xlim(0, 1); ax.set_xlabel('|cos θ|'); ax.set_ylabel('PDF')
+            ax.set_title(labels[j]); ax.grid(True, ls=':', alpha=0.5)
+        axs[0].legend(loc='upper right')
+        fig.savefig(self.save_dir / '05B_wQ_align_overlay.png', dpi=self.DPI); plt.close(fig)
 
-        Qmn_dns = np.sum(self.Qp_np[msk] ** 2, axis=(1, 2))
-        Qmn_pred = np.sum(
-            (self.Qhp_pred_np[msk] * self.psi_pred_np[msk, None, None]) ** 2,
-            axis=(1, 2)
-        )
-        σ = np.std(Qmn_dns) + 1e-12
-        φ_dns, φ_pred = Qmn_dns / σ, Qmn_pred / σ
-        bins = np.linspace(-1, 1, 80)
-        bin_centres = 0.5 * (bins[:-1] + bins[1:])
-        φ_dns_binned = self._bin_average(qe2[msk], φ_dns, bins)
-        φ_pred_binned = self._bin_average(qe2[msk], φ_pred, bins)
+    # ------------------------------------------------------------------ #
+    # 6) ψ marginal PDFs — DNS-only + overlay with RMSE marker
+    # ------------------------------------------------------------------ #
+    def fig_06_psi_pdf(self):
+        self._prepare()
+        psi_t, psi_p = self.psi_true_np, self.psi_pred_np
+        rmse = float(np.sqrt(np.mean((psi_p - psi_t) ** 2)))
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.plot(bin_centres, φ_dns_binned, 'v-', label="DNS", ms=7)
-        ax.plot(bin_centres, φ_pred_binned, '*-', label="AIBM", ms=8)
-        ax.set_xlim(-1, 1)
-        ax.set_xlabel(r"$q\,\varepsilon^{2}$")
-        ax.set_ylabel(r"$\phi$")
-        ax.set_title(r"$\phi$ vs $q\varepsilon^{2}$")
-        ax.axhline(0, ls=':', c='k')
-        ax.grid(ls=':', alpha=0.7)
-        ax.legend()
-        fig.savefig(self.run_dir / "fig_phi_qe2.png")
-        if show: plt.show()
-        plt.close(fig)
+        # DNS only
+        fig, ax = plt.subplots(figsize=(6.9, 4.8))
+        xs, ys = self._pdf_curve(psi_t, bins=160,
+                                 clip=(np.percentile(psi_t, 0.1), np.percentile(psi_t, 99.9)))
+        ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+        ax.set_xlabel(r'$\psi$'); ax.set_ylabel('PDF'); ax.grid(True, ls=':', alpha=0.5)
+        ax.set_title(r'DNS: marginal PDF of $\psi$'); ax.legend()
+        fig.savefig(self.save_dir / '06A_psi_pdf_dns.png', dpi=self.DPI); plt.close(fig)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Internal helpers
-    # ──────────────────────────────────────────────────────────────────────
-    def _to_numpy(self):
-        """Detach & move every tensor needed for plotting to CPU-numpy."""
-        self.q_np   = self.q.cpu().numpy()
-        self.r_np   = self.r.cpu().numpy()
-        self.eps_np = self.eps.cpu().numpy()
-        self.s_np   = self.s_norm.cpu().numpy()
-        self.w_np   = self.w.cpu().numpy()
-        self.Qp_np  = self.Qp.cpu().numpy()
-        self.Qhp_np = self.Qhp.cpu().numpy()
-        self.Qhp_pred_np = self.Qhp_pred.cpu().numpy()
-        self.psi_true_np = self.psi_true.cpu().numpy()
-        self.psi_pred_np = self.psi_pred.cpu().numpy()
+        # Overlay + RMSE vertical line
+        fig, ax = plt.subplots(figsize=(6.9, 4.8))
+        xs, ys = self._pdf_curve(psi_t, bins=160,
+                                 clip=(np.percentile(psi_t, 0.1), np.percentile(psi_t, 99.9)))
+        ax.plot(xs, ys, 'k-', lw=2, label='DNS')
+        xs2, ys2 = self._pdf_curve(psi_p, bins=160,
+                                   clip=(np.percentile(psi_p, 0.1), np.percentile(psi_p, 99.9)))
+        ax.plot(xs2, ys2, 'C1--', lw=2, label='AIBM')
+        ax.axvline(rmse, color='C3', lw=1.8, ls='-.', label=f'RMSE = {rmse:.3f}')
+        ax.set_xlabel(r'$\psi$'); ax.set_ylabel('PDF'); ax.grid(True, ls=':', alpha=0.5)
+        ax.set_title(r'DNS vs AIBM: marginal PDF of $\psi$'); ax.legend()
+        fig.savefig(self.save_dir / '06B_psi_pdf_overlay_rmse.png', dpi=self.DPI); plt.close(fig)
 
-    @staticmethod
-    def _rotation_matrix_z(theta: float):
-        c, s = np.cos(theta), np.sin(theta)
-        return torch.tensor([[c, -s, 0],
-                            [s,  c, 0],
-                            [0,  0, 1]], dtype=torch.float32)
+    # ------------------------------------------------------------------ #
+    # 7) φ vs qε² — NO EMA; DNS-only and DNS/AIBM each with full & zoom
+    # ------------------------------------------------------------------ #
+    # ---------- inside class AIBMVisualizer ----------
 
     @staticmethod
-    def _abs_cos(a: np.ndarray, b: np.ndarray):
-        """|cosθ| for two vector fields (N,3)."""
-        dot = np.sum(a * b, axis=1)
-        return np.clip(np.abs(dot), 0, 1)
+    def _std_2pass(x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=np.float64).ravel()
+        n = x.size
+        if n <= 1: return 0.0
+        mu = float(np.mean(x, dtype=np.float64))
+        ssd = float(np.sum((x - mu)**2, dtype=np.float64))
+        return float(np.sqrt(ssd / max(n - 1, 1)))
 
     @staticmethod
-    def _vorticity_vector(w: np.ndarray):
-        vort = np.empty((w.shape[0], 3))
-        vort[:, 0] = w[:, 2, 1] - w[:, 1, 2]
-        vort[:, 1] = w[:, 0, 2] - w[:, 2, 0]
-        vort[:, 2] = w[:, 1, 0] - w[:, 0, 1]
-        norm = np.linalg.norm(vort, axis=1, keepdims=True) + 1e-12
-        return vort / norm
+    def _binned_mean_precise(x: np.ndarray, y: np.ndarray, edges: np.ndarray,
+                            min_count: int = 20, interpolate_gaps: bool = True):
+        x = np.asarray(x, dtype=np.float64).ravel()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        m = len(edges) - 1
+        xc = 0.5 * (edges[:-1] + edges[1:])
+        idx = np.searchsorted(edges, x, side='right') - 1
+        ok = (idx >= 0) & (idx < m)
+        if not np.any(ok):
+            return xc, np.full(m, np.nan), np.zeros(m, int)
+        idx = idx[ok]; y = y[ok]
+        cnt = np.bincount(idx, minlength=m).astype(int)
+        s   = np.bincount(idx, weights=y, minlength=m).astype(np.float64)
+        mean = np.full(m, np.nan, float)
+        nz = cnt > 0
+        mean[nz] = s[nz] / cnt[nz]
+        mean[cnt < min_count] = np.nan
+        if interpolate_gaps and np.isnan(mean).any():
+            good = ~np.isnan(mean)
+            if np.any(good):
+                mean = np.interp(np.arange(m, dtype=float),
+                                np.flatnonzero(good).astype(float),
+                                mean[good])
+        return xc, mean, cnt
 
-    @staticmethod
-    def _eigen_ratio(t_orig: torch.Tensor, t_rot: torch.Tensor):
-        eig_o = np.linalg.eigvalsh(t_orig.detach().cpu().numpy())
-        eig_r = np.linalg.eigvalsh(t_rot.detach().cpu().numpy())
-        return (eig_r / (eig_o + 1e-8)).ravel()
+    def _phi_profile_precise(self, X: np.ndarray, Qsq: np.ndarray,
+                            nbins: int, xrng: tuple[float,float] | None,
+                            min_count: int = 20, interpolate_gaps: bool = True):
+        X   = np.asarray(X,   dtype=np.float64).ravel()
+        Qsq = np.asarray(Qsq, dtype=np.float64).ravel()
+        sigX = self._std_2pass(X)  + 1e-15
+        sigQ = self._std_2pass(Qsq)+ 1e-15
+        if xrng is None:
+            xmin, xmax = np.percentile(X, [0.5, 99.5])
+        else:
+            xmin, xmax = xrng
+        edges = np.linspace(xmin, xmax, nbins + 1, dtype=np.float64)
+        xc, cond, _ = self._binned_mean_precise(X, Qsq, edges,
+                                                min_count=min_count,
+                                                interpolate_gaps=interpolate_gaps)
+        phi = cond * (sigX / sigQ)           # Eq. (31)
+        return xc, phi
 
-    @staticmethod
-    def _bin_average(x, y, bins):
-        idx = np.digitize(x, bins) - 1
-        out = np.full(len(bins) - 1, np.nan)
-        for i in range(len(out)):
-            sel = idx == i
-            if sel.any():
-                out[i] = y[sel].mean()
-        return out
+    def fig_07_phi_qe2(self, nbins: int = 160, min_count: int = 20):
+        """
+        φ(x) = E[||Q||² | x] * (σ_{qε²} / σ_{||Q||²}), x = q ε².
+        Left: full range (native x). Right: zoom with standardized abscissa Xσ = x/σ_x (±1σ).
+        """
+        self._prepare()
+        X   = self.X_qe2_np                # q ε²  (native)
+        Y_D = self.Y_true_np               # ||Q||² DNS
+        Y_M = self.Y_pred_np               # ||Q||² AIBM
 
-    @staticmethod
-    def _format_qr_axes(ax):
-        ax.set_xlim(-1, 1)
-        ax.set_ylim(-1, 1)
-        ax.set_xlabel("r")
-        ax.set_ylabel("q")
-        ax.grid(ls=':', alpha=0.7)
+        # ---- full range (native) ----
+        xcD_full, phiD_full = self._phi_profile_precise(X, Y_D, nbins, xrng=None,
+                                                        min_count=min_count, interpolate_gaps=False)
+        xcM_full, phiM_full = self._phi_profile_precise(X, Y_M, nbins, xrng=None,
+                                                        min_count=min_count, interpolate_gaps=False)
+
+        # ---- zoom (standardized abscissa) ----
+        sigX = self._std_2pass(X) + 1e-15
+        Xs   = X / sigX                      # Xσ has std≈1 ⇒ [-1,1] is populated
+        edges_zoom = np.linspace(-1.0, +1.0, nbins + 1, dtype=np.float64)
+
+        xz, phiD_zoom, _ = self._binned_mean_precise(Xs, 
+                            Y_D * ( (self._std_2pass(X)+1e-15) / (self._std_2pass(Y_D)+1e-15) ),
+                            edges_zoom, min_count=min_count, interpolate_gaps=True)
+        _,  phiM_zoom, _ = self._binned_mean_precise(Xs, 
+                            Y_M * ( (self._std_2pass(X)+1e-15) / (self._std_2pass(Y_M)+1e-15) ),
+                            edges_zoom, min_count=min_count, interpolate_gaps=True)
+
+        # ---- (A) DNS only ----
+        fig, axs = plt.subplots(1, 2, figsize=(12.2, 4.8), constrained_layout=True)
+        axs[0].plot(xcD_full, phiD_full, 'k-', lw=2, label='DNS')
+        axs[0].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[0].set_ylabel(r'$\phi(x)$')
+        axs[0].set_title('DNS: full range (native)'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
+
+        axs[1].plot(xz, phiD_zoom, 'k-', lw=2, label='DNS')
+        axs[1].set_xlim(-1.0, +1.0); axs[1].set_ylim(0.00, 0.25)
+        axs[1].set_xlabel(r'$q\,\varepsilon^{2}/\sigma_{q\varepsilon^{2}}$'); axs[1].set_ylabel(r'$\phi(x)$')
+        axs[1].set_title('DNS: zoom (standardized abscissa)'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
+        fig.savefig(self.save_dir / '07A_phi_qe2_dns_full_and_zoom.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+        # ---- (B) DNS vs AIBM ----
+        fig, axs = plt.subplots(1, 2, figsize=(12.2, 4.8), constrained_layout=True)
+        axs[0].plot(xcD_full, phiD_full, 'k-', lw=2, label='DNS')
+        axs[0].plot(xcM_full, phiM_full, 'C1--', lw=2, label='AIBM')
+        axs[0].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[0].set_ylabel(r'$\phi(x)$')
+        axs[0].set_title('DNS vs AIBM: full range (native)'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
+
+        axs[1].plot(xz, phiD_zoom, 'k-', lw=2, label='DNS')
+        axs[1].plot(xz, phiM_zoom, 'C1--', lw=2, label='AIBM')
+        axs[1].set_xlim(-1.0, +1.0); axs[1].set_ylim(0.00, 0.25)
+        axs[1].set_xlabel(r'$q\,\varepsilon^{2}/\sigma_{q\varepsilon^{2}}$'); axs[1].set_ylabel(r'$\phi(x)$')
+        axs[1].set_title('DNS vs AIBM: zoom (standardized abscissa)'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
+        fig.savefig(self.save_dir / '07B_phi_qe2_overlay_full_and_zoom.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+    # ------------------------------------------------------------------ #
+    # Orchestrator
+    # ------------------------------------------------------------------ #
+    def plot_all(self):
+        self.fig_01_psi_qr()                     # 01A, 01B (legends + colorbars)
+        self.fig_02_qr_pdf()                     # 02A, 02B (colorbars + legends)
+        self.fig_03_rotation_invariance(30.0)    # 03A, 03B
+        self.fig_04_s_vs_Q()                     # 04A, 04B (ASC order; requested layout)
+        self.fig_05_w_vs_Q()                     # 05A, 05B (ASC order; requested layout)
+        self.fig_06_psi_pdf()                    # 06A, 06B (RMSE line)
+        self.fig_07_phi_qe2()                    # 07A, 07B (full & zoom)
+
 
 # ==============================================================================
 # 7. MAIN EXECUTION SCRIPT
