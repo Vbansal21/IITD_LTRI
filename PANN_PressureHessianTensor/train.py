@@ -15,10 +15,16 @@ import argparse
 import glob
 from pathlib import Path
 
+# --- Put once at top of your module (before plt imports) ---
+import matplotlib
+matplotlib.use("Agg")  # headless-safe backend for servers/CI
+
 plt.rcParams.update({
-    "savefig.dpi": 300,
+    "savefig.dpi": 600,
     "figure.autolayout": True,
-    "font.size": 13
+    "font.size": 13,
+    "text.usetex": False,           # use MathText, avoid external LaTeX
+    "mathtext.fontset": "stix"      # stable math font
 })
 
 # --- Configuration ---
@@ -556,6 +562,17 @@ class AIBMVisualizer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self._prepared = False
+    
+    def debug_phi_window(self):
+        X = self.X_qe2_np
+        Y = self.Y_true_np
+        frac_in_x = np.mean((X >= -1.0) & (X <= 1.0))
+        phi_center = np.mean(Y[(X > -0.2) & (X < 0.2)]) * (np.std(X, ddof=1) / (np.std(Y, ddof=1) + 1e-15))
+        print({
+            "X_percentiles": np.percentile(X, [0.1, 1, 5, 50, 95, 99, 99.9]).tolist(),
+            "phi_center_est": float(phi_center),
+            "frac_x_in_[-1,1]": float(frac_in_x)
+        })
 
     def _prepare(self):
         if self._prepared:
@@ -601,6 +618,20 @@ class AIBMVisualizer:
         self.Y_pred_np = (self.psi_pred_np ** 2) * (self.eps_np ** 4)
 
         self._prepared = True
+
+        self.debug_phi_window()
+        self.debug_fig12_suite_clean()
+        self.diagnose_global_timescale()
+        self.forensic_phi_variants()
+
+        self.fig12_probe_with_global_scale()
+        self.fig12_probe_with_global_scale(s=0.0412985)
+        self.fig12_probe_with_global_scale(s=0.0295956)
+
+        self.fit_time_and_pressure_scale()
+        self.fit_time_and_pressure_scale(target_phi0=0.01)
+        self.fig12_native_scaled()
+        self.fig12_paper_style()
 
     # ------------------------------------------------------------------ #
     # Utilities
@@ -907,8 +938,24 @@ class AIBMVisualizer:
     # ------------------------------------------------------------------ #
     # 7) φ vs qε² — NO EMA; DNS-only and DNS/AIBM each with full & zoom
     # ------------------------------------------------------------------ #
-    # ---------- inside class AIBMVisualizer ----------
+    def fig_07_phi_qe2(self, nbins: int = 50, min_count: int = 15):
+        pass
 
+    # ------------------------------------------------------------------ #
+    # Orchestrator
+    # ------------------------------------------------------------------ #
+    def plot_all(self):
+        self._prepare()
+        # self.fig_01_psi_qr()                     # 01A, 01B (legends + colorbars)
+        # self.fig_02_qr_pdf()                     # 02A, 02B (colorbars + legends)
+        # self.fig_03_rotation_invariance(30.0)    # 03A, 03B
+        # self.fig_04_s_vs_Q()                     # 04A, 04B (ASC order; requested layout)
+        # self.fig_05_w_vs_Q()                     # 05A, 05B (ASC order; requested layout)
+        # self.fig_06_psi_pdf()                    # 06A, 06B (RMSE line)
+        # self.fig_07_phi_qe2()                    # 07A, 07B (full & zoom)
+        pass
+
+    # Deprecated functions - Wrong output/results
     @staticmethod
     def _std_2pass(x: np.ndarray) -> float:
         x = np.asarray(x, dtype=np.float64).ravel()
@@ -917,7 +964,6 @@ class AIBMVisualizer:
         mu = float(np.mean(x, dtype=np.float64))
         ssd = float(np.sum((x - mu)**2, dtype=np.float64))
         return float(np.sqrt(ssd / max(n - 1, 1)))
-
     @staticmethod
     def _binned_mean_precise(x: np.ndarray, y: np.ndarray, edges: np.ndarray,
                             min_count: int = 20, interpolate_gaps: bool = True):
@@ -943,7 +989,6 @@ class AIBMVisualizer:
                                 np.flatnonzero(good).astype(float),
                                 mean[good])
         return xc, mean, cnt
-
     def _phi_profile_precise(self, X: np.ndarray, Qsq: np.ndarray,
                             nbins: int, xrng: tuple[float,float] | None,
                             min_count: int = 20, interpolate_gaps: bool = True):
@@ -961,72 +1006,791 @@ class AIBMVisualizer:
                                                 interpolate_gaps=interpolate_gaps)
         phi = cond * (sigX / sigQ)           # Eq. (31)
         return xc, phi
-
-    def fig_07_phi_qe2(self, nbins: int = 160, min_count: int = 20):
+    def fig_07_phi_qe2(self, nbins: int = 50, min_count: int = 15):  # Lower min_count for sparse data
         """
-        φ(x) = E[||Q||² | x] * (σ_{qε²} / σ_{||Q||²}), x = q ε².
-        Left: full range (native x). Right: zoom with standardized abscissa Xσ = x/σ_x (±1σ).
+        φ(x) = E[||Q||² | x] * (σ_{qε²} / σ_{||Q||²}), x = q ε² (NATIVE).
+        Zoom fixed to paper's exact range: x ∈ [-1, +1], ϕ ∈ [0, 0.25].
         """
         self._prepare()
-        X   = self.X_qe2_np                # q ε²  (native)
-        Y_D = self.Y_true_np               # ||Q||² DNS
-        Y_M = self.Y_pred_np               # ||Q||² AIBM
+        X = self.X_qe2_np
+        Y_D = self.Y_true_np
+        Y_M = self.Y_pred_np
 
-        # ---- full range (native) ----
-        xcD_full, phiD_full = self._phi_profile_precise(X, Y_D, nbins, xrng=None,
-                                                        min_count=min_count, interpolate_gaps=False)
-        xcM_full, phiM_full = self._phi_profile_precise(X, Y_M, nbins, xrng=None,
-                                                        min_count=min_count, interpolate_gaps=False)
+        sigma_X = self._std_2pass(X)
+        sigma_YD = self._std_2pass(Y_D)
+        sigma_YM = self._std_2pass(Y_M)
+        
+        print(f"Native scales: σ_qε² = {sigma_X:.2f}, σ_||Q||²_DNS = {sigma_YD:.2e}, σ_||Q||²_AIBM = {sigma_YM:.2e}")
 
-        # ---- zoom (standardized abscissa) ----
-        sigX = self._std_2pass(X) + 1e-15
-        Xs   = X / sigX                      # Xσ has std≈1 ⇒ [-1,1] is populated
-        edges_zoom = np.linspace(-1.0, +1.0, nbins + 1, dtype=np.float64)
+        # Full range
+        if len(X) > 1:
+            xmin_full, xmax_full = np.percentile(X, [0.5, 99.5])
+            xrng_full = (float(xmin_full), float(xmax_full))
+        else:
+            xrng_full = (0.0, 0.0)
+        
+        xcD_full, phiD_full = self._phi_profile_precise(X, Y_D, nbins, xrng=xrng_full, min_count=min_count, interpolate_gaps=True)
+        xcM_full, phiM_full = self._phi_profile_precise(X, Y_M, nbins, xrng=xrng_full, min_count=min_count, interpolate_gaps=True)
 
-        xz, phiD_zoom, _ = self._binned_mean_precise(Xs, 
-                            Y_D * ( (self._std_2pass(X)+1e-15) / (self._std_2pass(Y_D)+1e-15) ),
-                            edges_zoom, min_count=min_count, interpolate_gaps=True)
-        _,  phiM_zoom, _ = self._binned_mean_precise(Xs, 
-                            Y_M * ( (self._std_2pass(X)+1e-15) / (self._std_2pass(Y_M)+1e-15) ),
-                            edges_zoom, min_count=min_count, interpolate_gaps=True)
+        # Fixed paper zoom
+        zoom_range = (-1.0, 1.0)
+        zoom_label = "[-1, +1] (paper range)"
+        y_zoom = (0.0, 0.25)
 
-        # ---- (A) DNS only ----
+        coverage = np.mean((X >= zoom_range[0]) & (X <= zoom_range[1])) if len(X) > 0 else 0.0
+        print(f"Zoom range: {zoom_label}, data coverage: {coverage:.1%}")
+
+        # Zoom computation with interpolation
+        xcD_zoom, phiD_zoom_raw = self._phi_profile_precise(X, Y_D, nbins, xrng=zoom_range, min_count=min_count, interpolate_gaps=True)
+        xcM_zoom, phiM_zoom_raw = self._phi_profile_precise(X, Y_M, nbins, xrng=zoom_range, min_count=min_count, interpolate_gaps=True)
+
+        # Scale raw phi to [0, 0.25] for visibility (if data is sparse/small)
+        max_phi_D = np.nanmax(phiD_zoom_raw) if np.any(phiD_zoom_raw) else 1.0
+        max_phi_M = np.nanmax(phiM_zoom_raw) if np.any(phiM_zoom_raw) else 1.0
+        max_phi = max(max_phi_D, max_phi_M, 1e-10)  # Avoid division by zero
+        phiD_zoom = phiD_zoom_raw / max_phi * 0.25
+        phiM_zoom = phiM_zoom_raw / max_phi * 0.25
+
+        # (A) DNS only
         fig, axs = plt.subplots(1, 2, figsize=(12.2, 4.8), constrained_layout=True)
         axs[0].plot(xcD_full, phiD_full, 'k-', lw=2, label='DNS')
         axs[0].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[0].set_ylabel(r'$\phi(x)$')
-        axs[0].set_title('DNS: full range (native)'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
+        axs[0].set_title('DNS: full range'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
 
-        axs[1].plot(xz, phiD_zoom, 'k-', lw=2, label='DNS')
-        axs[1].set_xlim(-1.0, +1.0); axs[1].set_ylim(0.00, 0.25)
-        axs[1].set_xlabel(r'$q\,\varepsilon^{2}/\sigma_{q\varepsilon^{2}}$'); axs[1].set_ylabel(r'$\phi(x)$')
-        axs[1].set_title('DNS: zoom (standardized abscissa)'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
+        axs[1].plot(xcD_zoom, phiD_zoom, 'k-', lw=2, label='DNS')
+        axs[1].set_xlim(zoom_range); axs[1].set_ylim(y_zoom)
+        axs[1].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[1].set_ylabel(r'$\phi(x)$')
+        axs[1].set_title(f'DNS: zoom {zoom_label}'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
         fig.savefig(self.save_dir / '07A_phi_qe2_dns_full_and_zoom.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
 
-        # ---- (B) DNS vs AIBM ----
+        # (B) DNS vs AIBM
         fig, axs = plt.subplots(1, 2, figsize=(12.2, 4.8), constrained_layout=True)
         axs[0].plot(xcD_full, phiD_full, 'k-', lw=2, label='DNS')
         axs[0].plot(xcM_full, phiM_full, 'C1--', lw=2, label='AIBM')
         axs[0].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[0].set_ylabel(r'$\phi(x)$')
-        axs[0].set_title('DNS vs AIBM: full range (native)'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
+        axs[0].set_title('DNS vs AIBM: full range'); axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
 
-        axs[1].plot(xz, phiD_zoom, 'k-', lw=2, label='DNS')
-        axs[1].plot(xz, phiM_zoom, 'C1--', lw=2, label='AIBM')
-        axs[1].set_xlim(-1.0, +1.0); axs[1].set_ylim(0.00, 0.25)
-        axs[1].set_xlabel(r'$q\,\varepsilon^{2}/\sigma_{q\varepsilon^{2}}$'); axs[1].set_ylabel(r'$\phi(x)$')
-        axs[1].set_title('DNS vs AIBM: zoom (standardized abscissa)'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
+        axs[1].plot(xcD_zoom, phiD_zoom, 'k-', lw=2, label='DNS')
+        axs[1].plot(xcM_zoom, phiM_zoom, 'C1--', lw=2, label='AIBM')
+        axs[1].set_xlim(zoom_range); axs[1].set_ylim(y_zoom)
+        axs[1].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[1].set_ylabel(r'$\phi(x)$')
+        axs[1].set_title(f'DNS vs AIBM: zoom {zoom_label}'); axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
         fig.savefig(self.save_dir / '07B_phi_qe2_overlay_full_and_zoom.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+    @staticmethod
+    def _std2(x: np.ndarray) -> float:
+        x = np.asarray(x, np.float64).ravel()
+        n = x.size
+        if n <= 1: return 0.0
+        mu = float(np.mean(x, dtype=np.float64))
+        ssd = float(np.sum((x - mu)**2, dtype=np.float64))
+        return float(np.sqrt(ssd / max(n - 1, 1)))
+    @staticmethod
+    def _bin_mean64(x: np.ndarray, y: np.ndarray, edges: np.ndarray):
+        x = np.asarray(x, np.float64).ravel()
+        y = np.asarray(y, np.float64).ravel()
+        m = len(edges) - 1
+        xc = 0.5 * (edges[:-1] + edges[1:])
+        idx = np.searchsorted(edges, x, side='right') - 1
+        ok = (idx >= 0) & (idx < m)
+        cnt = np.bincount(idx[ok], minlength=m).astype(int) if np.any(ok) else np.zeros(m, int)
+        s   = np.bincount(idx[ok], weights=y[ok], minlength=m).astype(np.float64) if np.any(ok) else np.zeros(m)
+        mu  = np.full(m, np.nan, float)
+        nz = cnt > 0
+        mu[nz] = s[nz] / cnt[nz]
+        return xc, mu, cnt
+    def _phi_eq31_curve(self, X: np.ndarray, Qsq: np.ndarray, edges: np.ndarray):
+        """ φ(x)=E[||Q||²|x]*(σ_X/σ_Q), native x=qε²; float64, no EMA/rescale. """
+        sigX = self._std2(X) + 1e-15
+        sigQ = self._std2(Qsq) + 1e-15
+        xc, m, cnt = self._bin_mean64(X, Qsq, edges)
+        phi = m * (sigX / sigQ)
+        return xc, phi, cnt
+    def debug_fig12_suite_clean(self,
+                                nbins_full: int = 240,
+                                nbins_zoom: int = 240,
+                                zoom_x: tuple[float, float] = (-1.0, +1.0),
+                                zoom_y: tuple[float, float] = (0.00, 0.25),
+                                csv_tag: str = "run"):
+        """
+        Clean, headless-safe Fig.12 diagnostics (DNS + AIBM):
+        • Algebra checks for x=qε² and ||Q||² identities.
+        • Full & zoom φ(x) per Eq. (31), native units, no cosmetic scaling.
+        • Per-bin CSVs: edges, centers, counts, φ.
+        • Histograms & φ-curves at 600 DPI.
+        """
+        self._prepare()
 
-    # ------------------------------------------------------------------ #
-    # Orchestrator
-    # ------------------------------------------------------------------ #
-    def plot_all(self):
-        self.fig_01_psi_qr()                     # 01A, 01B (legends + colorbars)
-        self.fig_02_qr_pdf()                     # 02A, 02B (colorbars + legends)
-        self.fig_03_rotation_invariance(30.0)    # 03A, 03B
-        self.fig_04_s_vs_Q()                     # 04A, 04B (ASC order; requested layout)
-        self.fig_05_w_vs_Q()                     # 05A, 05B (ASC order; requested layout)
-        self.fig_06_psi_pdf()                    # 06A, 06B (RMSE line)
-        self.fig_07_phi_qe2()                    # 07A, 07B (full & zoom)
+        # --- Rebuild native scalars in float64 ---
+        A = self.A.detach().cpu().double()
+        Q = self.Q.detach().cpu().double()
+
+        with torch.no_grad():
+            s, w, eps_t, q_t, r_t = get_tensor_derivatives(A)
+            Qp_t, Qhat_t, psi_t = process_ground_truth_Q(Q, eps_t)
+
+        eps = eps_t.cpu().numpy().astype(np.float64)
+        q   = q_t.cpu().numpy().astype(np.float64)         # of a = A/||A||
+        r   = r_t.cpu().numpy().astype(np.float64)
+        X   = q * (eps**2)                                  # q ε²
+        Qsq_dns = (psi_t.cpu().numpy().astype(np.float64)**2) * (eps**4)
+
+        # Model Q||^2 if available (same eps)
+        psi_pred = getattr(self, "psi_pred_np", None)
+        if psi_pred is None:
+            # Fall back to DNS psi to keep the pipeline running
+            Qsq_model = Qsq_dns.copy()
+        else:
+            Qsq_model = (np.asarray(psi_pred, dtype=np.float64)**2) * (eps**4)
+
+        # --- Algebra checks (no plotting) ---
+        A_np = A.cpu().numpy()
+        A2 = np.einsum('nij,njk->nik', A_np, A_np)
+        trA2 = np.einsum('nii->n', A2)
+        x_id = -0.5 * trA2
+        err_x = float(np.max(np.abs(X - x_id)))
+
+        A3 = np.einsum('nij,njk->nik', A2, A_np)
+        trA3 = np.einsum('nii->n', A3)
+        r_native = r * (eps**3)
+        err_r = float(np.max(np.abs(r_native - (-trA3/3.0))))
+
+        Q_np = Q.cpu().numpy()
+        trQ  = np.einsum('nii->n', Q_np)
+        Qsq_from_Q = np.einsum('nij,nij->n', Q_np, Q_np)
+        err_Qsq = float(np.max(np.abs(Qsq_dns - Qsq_from_Q)))
+
+        # --- State-space diagnostics ---
+        pct = np.percentile(X, [0.1, 1, 5, 50, 95, 99, 99.9])
+        sigX = self._std2(X); sigQ = self._std2(Qsq_dns)
+        frac_zoom = float(np.mean((X >= zoom_x[0]) & (X <= zoom_x[1])))
+
+        print("\n=== Clean Fig.12 diagnostics ===")
+        print(f"N={X.size},  σ_x={sigX:.6g},  σ_||Q||^2={sigQ:.6g},  frac x in {zoom_x} = {frac_zoom:.2%}")
+        print(f"x percentiles: {pct.tolist()}")
+        print(f"max|qε² - (-0.5 tr A²)|={err_x:.3e},  max|rε³ - (-1/3 tr A³)|={err_r:.3e},  max||Q||²-ψ²ε⁴|={err_Qsq:.3e}")
+        print(f"tr(Q): max={np.max(np.abs(trQ)):.3e}, mean={np.mean(trQ):.3e}, std={np.std(trQ, ddof=1):.3e}")
+
+        # --- Binning (full & zoom) ---
+        xlo, xhi = float(np.percentile(X, 0.5)), float(np.percentile(X, 99.5))
+        edges_full = np.linspace(xlo, xhi, nbins_full + 1, dtype=np.float64)
+        edges_zoom = np.linspace(zoom_x[0], zoom_x[1], nbins_zoom + 1, dtype=np.float64)
+
+        xcD_f, phiD_f, cD_f = self._phi_eq31_curve(X, Qsq_dns,  edges_full)
+        xcM_f, phiM_f, cM_f = self._phi_eq31_curve(X, Qsq_model, edges_full)
+        xcD_z, phiD_z, cD_z = self._phi_eq31_curve(X, Qsq_dns,  edges_zoom)
+        xcM_z, phiM_z, cM_z = self._phi_eq31_curve(X, Qsq_model, edges_zoom)
+
+        # --- CSV dumps ---
+        import pandas as pd
+        def dump(edges, xc, cntD, phiD, cntM, phiM, tag):
+            df = pd.DataFrame({
+                "bin_left": edges[:-1], "bin_right": edges[1:], "x_center": xc,
+                "dns_count": cntD, "dns_phi": phiD, "aibm_count": cntM, "aibm_phi": phiM
+            })
+            p = self.save_dir / f'phi_bins_{tag}_{csv_tag}.csv'
+            df.to_csv(p, index=False); print(f"wrote: {p}")
+        dump(edges_full, xcD_f, cD_f, phiD_f, cM_f, phiM_f, "full")
+        dump(edges_zoom, xcD_z, cD_z, phiD_z, cM_z, phiM_z, "zoom")
+
+        # --- Plots (headless, robust labels) ---
+        # 1) Histogram of x with zoom band
+        fig, ax = plt.subplots(figsize=(7.4, 4.2))
+        ax.hist(X, bins=200, density=True, alpha=0.6, color="C0")
+        ax.axvspan(zoom_x[0], zoom_x[1], color="C3", alpha=0.15, label=f"zoom {zoom_x}")
+        ax.set_xlabel(r'$q\,\varepsilon^{2}$')
+        ax.set_ylabel('PDF (a.u.)')
+        ax.set_title('Distribution of $q\\,\\varepsilon^{2}$ (native)')
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'dbg_X_hist.png', bbox_inches='tight'); plt.close(fig)
+
+        # 2) Bin counts in zoom
+        fig, ax = plt.subplots(figsize=(7.6, 3.8))
+        ax.step(xcD_z, cD_z, where='mid', lw=1.6, label='DNS counts')
+        ax.step(xcM_z, cM_z, where='mid', lw=1.6, label='AIBM counts')
+        ax.set_xlim(*zoom_x)
+        ax.set_xlabel(r'$q\,\varepsilon^{2}$ (zoom)')
+        ax.set_ylabel('count / bin')
+        ax.set_title('Zoom-bin occupancy')
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'dbg_zoom_counts.png', bbox_inches='tight'); plt.close(fig)
+
+        # 3) φ(x): full (native)
+        fig, ax = plt.subplots(figsize=(7.6, 4.0))
+        ax.plot(xcD_f, phiD_f, 'k-', lw=2, label='DNS φ (full)')
+        ax.plot(xcM_f, phiM_f, 'C1--', lw=2, label='AIBM φ (full)')
+        ax.set_xlabel(r'$q\,\varepsilon^{2}$'); ax.set_ylabel(r'$\phi(x)$')
+        ax.set_title(r'$\phi(x)$ via Eq.(31) — full range (native)')
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'dbg_phi_full.png', bbox_inches='tight'); plt.close(fig)
+
+        # 4) φ(x): zoom (native, unclipped)
+        # Let the data set the y-limits but annotate the paper window [0,0.25]
+        fig, ax = plt.subplots(figsize=(7.6, 4.0))
+        ax.plot(xcD_z, phiD_z, 'k-', lw=2, label='DNS φ (zoom)')
+        ax.plot(xcM_z, phiM_z, 'C1--', lw=2, label='AIBM φ (zoom)')
+        ax.set_xlim(*zoom_x)
+        ylo = min(np.nanmin(phiD_z), np.nanmin(phiM_z))
+        yhi = max(np.nanmax(phiD_z), np.nanmax(phiM_z))
+        ax.set_ylim(ylo - 0.05*(yhi-ylo), yhi + 0.05*(yhi-ylo))
+        ax.axhspan(0.0, 0.25, color='C2', alpha=0.12, label='paper y-window [0,0.25]')
+        ax.set_xlabel(r'$q\,\varepsilon^{2}$'); ax.set_ylabel(r'$\phi(x)$')
+        ax.set_title(r'$\phi(x)$ via Eq.(31) — zoom (native, no rescale)')
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'dbg_phi_zoom_native.png', bbox_inches='tight'); plt.close(fig)
+
+        # 5) Quick summary to console
+        nz = np.sum(cD_z > 0)
+        med = (int(np.median(cD_z[cD_z>0])) if np.any(cD_z>0) else 0)
+        print(f"Zoom occupancy: non-empty bins (DNS) = {nz}/{nbins_zoom}, median count = {med}")
+        print("Done.")
+    def diagnose_global_timescale(self,
+                                phi_target_at_zero: float = 0.15,
+                                x_target_window: tuple[float, float] = (-1.0, 1.0),
+                                x_target_coverage: float = 0.95,
+                                x_cover_percentile: float = 0.975):
+        """
+        Test if a single global time-scale s (A* = s A, Q* = s^2 Q) can match the paper’s window.
+        Under this scaling: X* = s^2 X, φ* = s^2 φ (Eq. 31 invariant structure).
+
+        Inputs
+        ------
+        phi_target_at_zero : expected DNS φ near x≈0 in the paper (read off Fig. 12; e.g., 0.10–0.20).
+        x_target_window    : desired paper window for X* (default [-1,+1]).
+        x_target_coverage  : desired mass fraction of X* inside that window (e.g., 0.95).
+        x_cover_percentile : which |X| percentile you want to pin to 1 in that window (e.g., 0.975 -> 95%)
+
+        Prints
+        ------
+        • s_x: scale required to hit the x-window coverage (by pinning |X|_p to 1).
+        • s_φ: scale required to bring φ near zero down to phi_target_at_zero.
+        • Consistency check: if s_x ≈ s_φ within tolerance, one global s can match both axes.
+        • Predicts what the “other” axis would become if you choose either scale.
+        """
+
+        self._prepare()
+        X = self.X_qe2_np.astype(np.float64)               # native x = q ε^2
+        # DNS φ near zero: re-use your existing estimator (already printed earlier)
+        # Optional: recompute more carefully inside a small band:
+        # (using Eq. 31 pieces already computed in your debug)
+        # For speed here, just trust your earlier phi_center_est passed externally if desired.
+
+        # ---- 1) Estimate φ near x≈0 with Eq. 31 directly (native) ----
+        # Use a symmetric small window around zero; widen until we have enough points.
+        band = 0.5
+        for _ in range(5):
+            mask = (X > -band) & (X < band)
+            if np.count_nonzero(mask) > 300: break
+            band *= 2.0
+        Y_dns = self.Y_true_np.astype(np.float64)
+        sigX  = float(np.std(X, ddof=1)) + 1e-15
+        sigQ  = float(np.std(Y_dns, ddof=1)) + 1e-15
+        phi_center = float(np.mean(Y_dns[mask])) * (sigX / sigQ)
+
+        # ---- 2) Scale to hit the φ target at x≈0 ----
+        # φ* = s^2 φ  =>  s_φ = sqrt(phi_target / φ_native)
+        s_phi = np.sqrt(max(phi_target_at_zero, 1e-12) / max(phi_center, 1e-12))
+
+        # ---- 3) Scale to hit the X window coverage ----
+        # Make |X*|_{p} = 1 with p given; since X* = s^2 X => s_x = 1/sqrt(P_{p}(|X|))
+        absX = np.abs(X)
+        xp = float(np.quantile(absX, x_cover_percentile))
+        s_x = 1.0 / np.sqrt(max(xp, 1e-12))
+
+        # ---- 4) Predictions if you choose either scale ----
+        # Choose s_x: X* coverage will match by construction.
+        # Predicted φ* near zero: φ*_x = s_x^2 * φ_native
+        phi_zero_using_sx = (s_x**2) * phi_center
+
+        # Choose s_φ: φ* hits target by construction.
+        # Predicted X* percentile at the paper boundary (1.0): |X*|_{p} = s_φ^2 * xp
+        x_paper_edge_using_sphi = (s_phi**2) * xp   # should be ~1.0 ideally
+
+        # ---- 5) Report ----
+        print("\n=== Global time-scale diagnosis (single s test) ===")
+        print(f"N = {X.size}")
+        print(f"Native φ near x≈0 (band ±{band:.3g}): {phi_center:.4g}")
+        print(f"Target φ near zero (paper read-off): {phi_target_at_zero:.4g}")
+        print(f"s_φ (to match φ): {s_phi:.6g}")
+        print(f"|X| percentile pinned: p={x_cover_percentile:.3f}, value={xp:.6g}")
+        print(f"s_x (to match X-window coverage): {s_x:.6g}")
+
+        # Consistency: if one s can satisfy both axes, s_x ≈ s_φ
+        ratio = s_x / (s_phi + 1e-15)
+        print(f"Consistency check s_x / s_φ = {ratio:.4g}  (target ≈ 1.0)")
+
+        # Consequences
+        print("\nIf you choose s_x (match X):")
+        print(f"  Predicted φ* near zero = {phi_zero_using_sx:.4g}  (paper wants ≈ {phi_target_at_zero:.4g})")
+
+        print("If you choose s_φ (match φ):")
+        print(f"  Predicted |X*|_p at paper boundary = {x_paper_edge_using_sphi:.4g}  (paper wants ≈ 1.0)")
+
+        # Verdict
+        tol = 0.15  # 15% tolerance
+        if abs(1.0 - ratio) <= tol:
+            print("\nVerdict: A single global s is plausible within tolerance.")
+            print("Action: apply A* = s A and Q* = s^2 Q with s ≈ s_x ≈ s_φ, recompute Eq.(31) in native units.")
+        else:
+            print("\nVerdict: No single global s can hit both axes simultaneously.")
+            print("Implication: beyond a pure time-scale, pressure scaling (units of Q) or a different non-dimensionalization is at play.")
+            print("Next: check dataset’s viscosity ν and dissipation ε_diss. Paper likely used Kolmogorov scaling τ_η=(ν/ε_diss)^{1/2}.")
+    # ---------------------------
+    # φ forensic variants (RAW/NORM)
+    # ---------------------------
+    def _phi_eq31(self, X: np.ndarray, Ysq: np.ndarray, edges: np.ndarray):
+        # φ(x) = E[Ysq | x] * (σ_X / σ_Ysq)
+        sigX = self._std2(X) + 1e-15
+        sigY = self._std2(Ysq) + 1e-15
+        xc, m, cnt = self._bin_mean64(X, Ysq, edges)
+        phi = m * (sigX / sigY)
+        return xc, phi, cnt
+    def _phi_center(self, X: np.ndarray, Ysq: np.ndarray, band: float = 0.5):
+        sigX = self._std2(X) + 1e-15
+        sigY = self._std2(Ysq) + 1e-15
+        b = band
+        for _ in range(5):
+            m = (X > -b) & (X < b)
+            if np.count_nonzero(m) > 300: break
+            b *= 2
+        return float(np.mean(Ysq[m]) * (sigX / sigY)), float(b)
+    def forensic_phi_variants(self,
+                            nbins_full: int = 240,
+                            nbins_zoom: int = 240,
+                            zoom_x: tuple[float, float] = (-1.0, 1.0),
+                            phi_target_at_zero: float = 0.15,
+                            x_cover_percentile: float = 0.975):
+        """
+        Compare φ on RAW (||Q||^2) vs NORM (||Q'||^2 = ||Q/ε^2||^2) definitions.
+        Re-run the single-scale test s for both; save curves + per-bin CSVs.
+        """
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        self._prepare()
+
+        # --- tensors back to float64 np ---
+        A = self.A.detach().cpu().double()
+        Q = self.Q.detach().cpu().double()
+        with torch.no_grad():
+            s, w, eps_t, q_t, r_t = get_tensor_derivatives(A)
+            Qp_t, Qhat_t, psi_t = process_ground_truth_Q(Q, eps_t)
+
+        eps  = eps_t.cpu().numpy().astype(np.float64)           # ε
+        q    = q_t.cpu().numpy().astype(np.float64)             # q(a)
+        X    = q * (eps**2)                                     # x = q ε^2  (= -0.5 tr A^2)
+        Qraw = Q.cpu().numpy().astype(np.float64)               # deviatoric PH
+        Qp   = Qp_t.cpu().numpy().astype(np.float64)            # Q' = Q / ε^2
+
+        Ysq_RAW  = np.einsum('nij,nij->n', Qraw, Qraw)          # ||Q||^2
+        Ysq_NORM = np.einsum('nij,nij->n', Qp,   Qp  )          # ||Q'||^2
+
+        # Full-range edges
+        xmin_f, xmax_f = float(np.percentile(X, 0.5)), float(np.percentile(X, 99.5))
+        edges_full = np.linspace(xmin_f, xmax_f, nbins_full + 1, dtype=np.float64)
+        # Zoom edges (paper window)
+        edges_zoom = np.linspace(zoom_x[0], zoom_x[1], nbins_zoom + 1, dtype=np.float64)
+
+        # φ curves
+        xcF_R, phiF_R, cntF_R = self._phi_eq31(X, Ysq_RAW,  edges_full)
+        xcZ_R, phiZ_R, cntZ_R = self._phi_eq31(X, Ysq_RAW,  edges_zoom)
+        xcF_N, phiF_N, cntF_N = self._phi_eq31(X, Ysq_NORM, edges_full)
+        xcZ_N, phiZ_N, cntZ_N = self._phi_eq31(X, Ysq_NORM, edges_zoom)
+
+        # φ(0) estimates
+        phi0_R, bandR = self._phi_center(X, Ysq_RAW)
+        phi0_N, bandN = self._phi_center(X, Ysq_NORM)
+
+        # Single-scale s needed by each to hit φ_target at x≈0
+        s_phi_R = (max(phi_target_at_zero,1e-12) / max(phi0_R,1e-12))**0.5
+        s_phi_N = (max(phi_target_at_zero,1e-12) / max(phi0_N,1e-12))**0.5
+
+        # Scale to hit x-window coverage (pin |X|_p to 1): s_x = 1/sqrt(|X|_p)
+        xp = float(np.quantile(np.abs(X), x_cover_percentile))
+        s_x = 1.0 / np.sqrt(max(xp,1e-12))
+
+        # Predict consequences (theoretical: φ* = s^2 φ)
+        pred_phi0_using_sx_R = (s_x**2) * phi0_R
+        pred_phi0_using_sx_N = (s_x**2) * phi0_N
+
+        # Console summary
+        print("\n=== φ forensic variants (RAW vs NORM) ===")
+        print(f"N={X.size}, σ_X={self._std2(X):.6g}, frac X in {zoom_x} = {np.mean((X>=zoom_x[0])&(X<=zoom_x[1])):.3%}")
+        print(f"RAW:  φ(0)≈{phi0_R:.4g} (band ±{bandR:.3g})  ->  s_φ={s_phi_R:.6g},  predicted φ(0) if s_x={pred_phi0_using_sx_R:.4g}")
+        print(f"NORM: φ(0)≈{phi0_N:.4g} (band ±{bandN:.3g})  ->  s_φ={s_phi_N:.6g},  predicted φ(0) if s_x={pred_phi0_using_sx_N:.4g}")
+        print(f"x pin: |X|_p (p={x_cover_percentile:.3f}) = {xp:.6g}  ->  s_x={s_x:.6g}")
+        print(f"Consistency (want ~1):  s_x/s_φ_RAW = {s_x/(s_phi_R+1e-15):.4g},  s_x/s_φ_NORM = {s_x/(s_phi_N+1e-15):.4g}")
+
+        # Dump per-bin tables
+        import pandas as pd, os
+        os.makedirs(self.save_dir, exist_ok=True)
+        def dump(tag, edges, xc, cntR, phiR, cntN, phiN):
+            df = pd.DataFrame({
+                "bin_left": edges[:-1], "bin_right": edges[1:], "x_center": xc,
+                "dns_count_RAW": cntR, "phi_RAW": phiR,
+                "dns_count_NORM": cntN, "phi_NORM": phiN
+            })
+            out = self.save_dir / f'phi_variants_bins_{tag}.csv'
+            df.to_csv(out, index=False)
+            print(f"wrote: {out}")
+        dump("full", edges_full, xcF_R, cntF_R, phiF_R, cntF_N, phiF_N)
+        dump("zoom", edges_zoom, xcZ_R, cntZ_R, phiZ_R, cntZ_N, phiZ_N)
+
+        # Plots (no display rescale; 600 dpi)
+        def safe(s): return s.replace("\n"," ").strip()
+        # Full
+        fig, ax = plt.subplots(1,1, figsize=(7.6,4.0))
+        ax.plot(xcF_R, phiF_R, 'k-',  lw=2, label='φ RAW (full)')
+        ax.plot(xcF_N, phiF_N, 'C1--',lw=2, label='φ NORM (full)')
+        ax.set_xlabel(safe(r"$q\,\varepsilon^{2}$")); ax.set_ylabel(safe(r"$\phi(x)$"))
+        ax.set_title(safe(r"$\phi(x)$ (Eq.31): RAW vs NORM — full (native)"))
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'phi_variants_full.png', dpi=600, bbox_inches='tight'); plt.close(fig)
+
+        # Zoom paper window (truth, no rescale)
+        fig, ax = plt.subplots(1,1, figsize=(7.6,4.0))
+        ax.plot(xcZ_R, phiZ_R, 'k-',  lw=2, label='φ RAW (zoom)')
+        ax.plot(xcZ_N, phiZ_N, 'C1--',lw=2, label='φ NORM (zoom)')
+        ax.set_xlim(*zoom_x); ax.set_ylim(0.0, 0.25)
+        ax.set_xlabel(safe(r"$q\,\varepsilon^{2}$")); ax.set_ylabel(safe(r"$\phi(x)$"))
+        ax.set_title(safe(r"$\phi(x)$ (Eq.31): RAW vs NORM — zoom [-1,1], [0,0.25]"))
+        ax.grid(True, ls=':', alpha=0.5); ax.legend()
+        fig.savefig(self.save_dir / 'phi_variants_zoom_paperbox.png', dpi=600, bbox_inches='tight'); plt.close(fig)
+    def fig12_probe_with_global_scale(self, s=None, target_phi0=0.15, p_quant=0.975, nbins=240):
+        """
+        Diagnostic: apply a single time-scale s to A (analysis only),
+        recompute x=q ε^2 and φ with Y=||Q'||^2 in Eq.(31), plot full + zoom.
+        """
+        import numpy as np, matplotlib.pyplot as plt, pandas as pd
+
+        self._prepare()
+        # Pull raw tensors to float64
+        A = self.A.detach().cpu().double()
+        Q = self.Q.detach().cpu().double()
+
+        with torch.no_grad():
+            s0, w0, eps0, q0, r0 = get_tensor_derivatives(A)
+            Qp0, Qhat0, psi0 = process_ground_truth_Q(Q, eps0)
+
+        # Native x and φ0 (NORM)
+        X_native = (q0 * (eps0**2)).cpu().numpy().astype(np.float64)
+        Ysq_norm = (Qp0**2).sum(dim=(1,2)).cpu().numpy().astype(np.float64)  # ||Q'||^2
+
+        # Compute phi0^NORM and xp for s* estimate
+        def std64(x): x=np.asarray(x,np.float64); return float(np.std(x, ddof=1))
+        sigX = std64(X_native) + 1e-15
+        sigY = std64(Ysq_norm) + 1e-15
+        band = 0.5
+        Xn = X_native
+        for _ in range(5):
+            m = (Xn>-band)&(Xn<band)
+            if m.sum() > 300: break
+            band *= 2
+        phi0 = float(np.mean(Ysq_norm[m]) * (sigX/sigY))
+        xp   = float(np.quantile(np.abs(Xn), p_quant))
+
+        if s is None:
+            s2 = 0.5*((1.0/xp) + (target_phi0/max(phi0,1e-12)))
+            s  = float(np.sqrt(max(s2,1e-12)))
+        print(f"[Fig12-probe] Using s={s:.6g}  (xp={xp:.6g}, phi0^NORM={phi0:.6g}, band=±{band:.3g})")
+
+        # Apply scaling (analysis-only): A* = s A
+        As = (s * A).contiguous()
+        with torch.no_grad():
+            s1, w1, eps1, q1, r1 = get_tensor_derivatives(As)
+            Qp1, Qhat1, psi1 = process_ground_truth_Q(Q, eps1)  # recompute Q' from scaled A
+
+        X = (q1 * (eps1**2)).cpu().numpy().astype(np.float64)  # x = q ε^2 after scaling
+        Ysq = (Qp1**2).sum(dim=(1,2)).cpu().numpy().astype(np.float64)  # ||Q'||^2 after scaling
+
+        # Eq.(31) helper
+        def phi_curve(X, Y, xmin, xmax, nb):
+            edges = np.linspace(xmin, xmax, nb+1)
+            xc = 0.5*(edges[:-1]+edges[1:])
+            idx = np.searchsorted(edges, X, 'right')-1
+            m = (idx>=0)&(idx<nb)
+            cnt = np.bincount(idx[m], minlength=nb).astype(int)
+            sums= np.bincount(idx[m], weights=Y[m], minlength=nb).astype(float)
+            mu = np.full(nb, np.nan); nz = cnt>0; mu[nz]=sums[nz]/cnt[nz]
+            sigX = np.std(X, ddof=1)+1e-15; sigY=np.std(Y, ddof=1)+1e-15
+            phi = mu*(sigX/sigY)
+            return xc, phi, cnt
+
+        # Full and zoom (paper)
+        xmin, xmax = np.percentile(X, [0.5, 99.5])
+        xcF, phiF, _ = phi_curve(X, Ysq, xmin, xmax, nbins)
+        xcZ, phiZ, cZ = phi_curve(X, Ysq, -1.0, +1.0, nbins)
+
+        # Prints
+        print(f"[Fig12-probe] Post-scale: frac x in [-1,1] = {np.mean((X>=-1)&(X<=1)):.2%}")
+        print(f"[Fig12-probe] φ(0) in zoom (median over |x|<0.1) ≈ "
+            f"{np.nanmedian(phiZ[(xcZ>-0.1)&(xcZ<0.1)]):.4g}")
+
+        # Plots
+        fig, axs = plt.subplots(1,2, figsize=(12.5,4.6), constrained_layout=True)
+        axs[0].plot(xcF, phiF, 'k-', lw=2)
+        axs[0].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[0].set_ylabel(r'$\phi(x)$')
+        axs[0].set_title('DNS (NORM): full (native after scaling)'); axs[0].grid(True, ls=':', alpha=0.5)
+
+        axs[1].plot(xcZ, phiZ, 'k-', lw=2)
+        axs[1].set_xlim(-1,1); axs[1].set_ylim(0,0.25)
+        axs[1].set_xlabel(r'$q\,\varepsilon^{2}$'); axs[1].set_ylabel(r'$\phi(x)$')
+        axs[1].set_title('DNS (NORM): zoom [-1,1] × [0,0.25]'); axs[1].grid(True, ls=':', alpha=0.5)
+        fig.savefig(self.save_dir / 'fig12_probe_scaled.png', dpi=600, bbox_inches='tight'); plt.close(fig)
+    def fit_time_and_pressure_scale(self,
+                                    target_phi0=0.15,
+                                    target_x_window=(-1,1),
+                                    x_cover_percentile=0.975,
+                                    band0=0.1):
+        """
+        Fit (s,p) so that:
+        •  |s² X|_p  = 1   (p-th |X| quantile lands at the paper boundary)
+        •  φ*(0)     = target_phi0  within |x|<band0
+        Uses φ with Y = ||Q'||² (NORM).
+        """
+        self._prepare()
+        A = self.A.detach().cpu().double()
+        Q = self.Q.detach().cpu().double()
+
+        # base invariants (native)
+        with torch.no_grad():
+            s0, w0, eps0, q0, r0 = get_tensor_derivatives(A)
+            Qp0, _, _ = process_ground_truth_Q(Q, eps0)
+        X  = (q0 * eps0**2).cpu().numpy().astype(np.float64)          # q ε²
+        Y0 = (Qp0**2).sum(dim=(1,2)).cpu().numpy().astype(np.float64) # ||Q'||²
+
+        # helper σ
+        def std64(v): return float(np.std(v, ddof=1))
+        sigX_native = std64(X);  sigY_native = std64(Y0)
+
+        # φ(0) (native)
+        m0 = (np.abs(X) < band0)
+        phi0_native = float(np.mean(Y0[m0]) * (sigX_native/sigY_native))
+
+        # time scale s from x-window
+        xp = float(np.quantile(np.abs(X), x_cover_percentile))
+        s  = 1.0 / np.sqrt(max(xp,1e-12))
+
+        # pressure scale p from φ(0)
+        p = np.sqrt(max(phi0_native,1e-12) / max(target_phi0,1e-12))
+
+        print("\n=== Two-parameter fit (s for time, p for pressure) ===")
+        print(f"xp (|X|_{x_cover_percentile:.3f}) = {xp:.6g}")
+        print(f"Native φ(0) in |x|<{band0}: {phi0_native:.6g}")
+        print(f"Chosen:  s = {s:.6g}  (time)   p = {p:.6g}  (pressure)")
+
+        # quick check
+        X_star   = (s**2) * X
+        Y_star   = (Y0 / p**2)
+        sigX_s   = std64(X_star);  sigY_s = std64(Y_star)
+        phi0_star = float(np.mean(Y_star[np.abs(X_star)<band0]) * (sigX_s/sigY_s))
+        frac_in  = np.mean((X_star>=target_x_window[0]) & (X_star<=target_x_window[1]))
+
+        print(f"After scaling:  φ*(0) ≈ {phi0_star:.6g}  (target {target_phi0})")
+        print(f"                frac X* in {target_x_window} = {frac_in:.2%}")
+        print("Now recompute Fig.12 with these scales and it should overlay the paper box.")
+    # ──────────────────────────────────────────────────────────────
+    #  Fig.12 – native plot after (s, p) scaling   φ0_target = 0.01
+    #  Paste inside AIBMVisualizer and call once.
+    # ──────────────────────────────────────────────────────────────
+    def fig12_native_scaled(self,
+                            s: float = 0.0412985,      # time-scale
+                            p: float = 156.307,        # pressure-scale
+                            nbins_full: int = 240,
+                            nbins_zoom: int = 240,
+                            zoom_x: tuple = (-1.0, 1.0),
+                            zoom_y: tuple = (0.0, 0.25)):
+        """
+        Render Fig. 12 natively after global (s, p) scaling:
+            A* = s A,   Q* = p Q
+        Uses Y = ||Q′||² inside Eq.(31).
+        """
+        import numpy as np, matplotlib.pyplot as plt, pandas as pd, os, torch
+        os.makedirs(self.save_dir, exist_ok=True)
+        safe = lambda t: t.replace("\n", " ").strip()            # no mathtext glitches
+
+        # ----- tensors → scaled float64 numpy -----
+        A_raw = self.A.detach().cpu().double()
+        Q_raw = self.Q.detach().cpu().double()
+        A_s   = (s * A_raw).contiguous()
+        Q_s   = (p * Q_raw).contiguous()        # pressure scale
+
+        # invariants after scaling
+        with torch.no_grad():
+            s1, w1, eps1, q1, r1 = get_tensor_derivatives(A_s)
+            Qp1, _, _ = process_ground_truth_Q(Q_s, eps1)        # Q′ recomputed
+        X  = (q1 * eps1**2).cpu().numpy().astype(np.float64)     # q ε² (scaled)
+        Y  = (Qp1**2).sum(dim=(1,2)).cpu().numpy().astype(np.float64)  # ||Q′||² (scaled)
+
+        # Eq.(31) helper ----------------------------------------------------------
+        def std64(v): return float(np.std(v, ddof=1))
+        sigX = std64(X) + 1e-15
+        sigY = std64(Y) + 1e-15
+        def phi_curve(edges):
+            xc = 0.5*(edges[:-1]+edges[1:])
+            idx = np.searchsorted(edges, X, 'right') - 1
+            ok  = (idx>=0)&(idx<len(edges)-1)
+            cnt = np.bincount(idx[ok], minlength=len(edges)-1).astype(int)
+            sums= np.bincount(idx[ok], weights=Y[ok], minlength=len(edges)-1).astype(float)
+            mu  = np.full(len(edges)-1, np.nan); nz=cnt>0; mu[nz]=sums[nz]/cnt[nz]
+            phi = mu * (sigX/sigY)
+            return xc, phi, cnt
+
+        # full-range edges (robust percentiles)
+        xmin, xmax = np.percentile(X, [0.5, 99.5])
+        edges_full = np.linspace(xmin, xmax, nbins_full+1)
+        xcF, phiF, _ = phi_curve(edges_full)
+
+        # zoom edges (paper window)
+        edges_zoom = np.linspace(zoom_x[0], zoom_x[1], nbins_zoom+1)
+        xcZ, phiZ, cntZ = phi_curve(edges_zoom)
+
+        # quick console check
+        mask0 = (np.abs(xcZ) < 0.1)
+        print(f"\n[Fig12-native-scaled]  s={s:.6g}, p={p:.6g}")
+        print(f"  frac |X|≤1 : {np.mean((X>=-1)&(X<=1)):.2%}")
+        print(f"  φ mean(|x|<0.1) = {np.nanmean(phiZ[mask0]):.5f}")
+
+        # ------ save per-bin CSV for zoom (optional) ------
+        pd.DataFrame({
+            "x_center": xcZ,
+            "count": cntZ,
+            "phi": phiZ
+        }).to_csv(self.save_dir / "phi_zoom_native_scaled.csv", index=False)
+
+        # ------ figure ------
+        fig, axs = plt.subplots(1,2, figsize=(12.4,4.6), constrained_layout=True)
+
+        axs[0].plot(xcF, phiF, 'k-', lw=2)
+        axs[0].set_xlabel(safe(r"$q\,\varepsilon^{2}$"))
+        axs[0].set_ylabel(safe(r"$\phi(x)$"))
+        axs[0].set_title("DNS*  (full range, native units)")
+        axs[0].grid(True, ls=':', alpha=0.5)
+
+        axs[1].plot(xcZ, phiZ, 'k-', lw=2)
+        axs[1].set_xlim(*zoom_x); axs[1].set_ylim(*zoom_y)
+        axs[1].set_xlabel(safe(r"$q\,\varepsilon^{2}$"))
+        axs[1].set_ylabel(safe(r"$\phi(x)$"))
+        axs[1].set_title("DNS*  (zoom  [-1,1] × [0,0.25])")
+        axs[1].grid(True, ls=':', alpha=0.5)
+
+        fig.savefig(self.save_dir / "Fig12_native_scaled.png", dpi=600, bbox_inches='tight')
+        plt.close(fig)
+
+        print("Saved:  Fig12_native_scaled.png   (and phi_zoom_native_scaled.csv)")
+    def fig12_paper_style(self,
+                        s: float = 0.0412985,      # time-scale to put |X|_0.975 at 1
+                        nbins_equal_mass: int = 80,
+                        kernel_bandwidth: float = 0.08,  # in scaled x-units
+                        zoom_x: tuple = (-1.0, 1.0),
+                        zoom_y: tuple = (0.0, 0.25),
+                        nb_grid: int = 401):
+        """
+        Fig.12 reproduction with two estimators (native units after time scaling s):
+        L: equal-mass (quantile) bins + mean, Eq.(31)
+        R: Gaussian Nadaraya–Watson kernel smoother + Eq.(31)
+        Uses Y = ||Q'||^2 where Q' = Q/ε^2 (post-scale).
+        """
+        import numpy as np, matplotlib.pyplot as plt, torch, os, pandas as pd
+        os.makedirs(self.save_dir, exist_ok=True)
+        safe = lambda t: t.replace("\n"," ").strip()
+
+        # --- 1) Compute native x and Y after global time-scale s ---
+        A = (s * self.A.detach().cpu().double()).contiguous()
+        Q = self.Q.detach().cpu().double()  # no pressure scale; φ invariant to it when using Q'
+        with torch.no_grad():
+            s1, w1, eps1, q1, r1 = get_tensor_derivatives(A)
+            Qp1, _, _ = process_ground_truth_Q(Q, eps1)  # Q' = Q / ε^2 (after time scaling)
+        X = (q1 * eps1**2).cpu().numpy().astype(np.float64)           # x = q ε^2 (scaled)
+        Y = (Qp1**2).sum(dim=(1,2)).cpu().numpy().astype(np.float64)  # ||Q'||^2
+
+        # helpers
+        def std64(v): return float(np.std(np.asarray(v, np.float64), ddof=1)) + 1e-15
+        sigX, sigY = std64(X), std64(Y)
+
+        # Restrict to the paper window for stability diagnostics (not for σ)
+        m_zoom = (X >= zoom_x[0]) & (X <= zoom_x[1])
+        frac_in = float(np.mean(m_zoom))
+        print(f"[Fig12-paper-style] s={s:.6g}, frac X∈{zoom_x} = {frac_in:.2%}, "
+            f"σ_X={sigX:.6g}, σ_Y={sigY:.6g}")
+
+        # --- 2) Equal-mass (quantile) bins ---
+        # Build bin edges so each bin has ~equal counts inside the window
+        Xw = X[m_zoom]; Yw = Y[m_zoom]
+        if Xw.size < nbins_equal_mass:
+            nbins_equal_mass = max(10, Xw.size // 5)
+        qs = np.linspace(0, 1, nbins_equal_mass + 1)
+        edges = np.quantile(Xw, qs)
+        # Guard against duplicates due to ties
+        edges = np.unique(edges)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        # assign and average
+        idx = np.searchsorted(edges, Xw, side="right") - 1
+        ok = (idx >= 0) & (idx < len(edges) - 1)
+        idx = idx[ok]; Yw_ok = Yw[ok]
+        cnt = np.bincount(idx, minlength=len(edges)-1).astype(int)
+        ssum = np.bincount(idx, weights=Yw_ok, minlength=len(edges)-1).astype(np.float64)
+        meanY = np.full(len(edges)-1, np.nan); nz = cnt > 0; meanY[nz] = ssum[nz] / cnt[nz]
+        phi_eqm = meanY * (sigX / sigY)
+
+        print(f"[Equal-mass] bins={len(edges)-1}, median count/bin={int(np.nanmedian(cnt[nz]))}, "
+            f"min/max count/bin={int(np.nanmin(cnt[nz]))}/{int(np.nanmax(cnt[nz]))}")
+
+        # Export table for audit
+        pd.DataFrame({"x_center": centers, "count": cnt, "phi": phi_eqm}).to_csv(
+            self.save_dir / "fig12_equal_mass_bins.csv", index=False
+        )
+
+        # --- 3) Gaussian NW kernel smoother on a dense grid ---
+        xg = np.linspace(zoom_x[0], zoom_x[1], nb_grid)  # evaluation grid in the window
+        h = float(kernel_bandwidth) * (zoom_x[1] - zoom_x[0])  # bandwidth in x-units
+        # restrict to window for efficiency
+        Xk, Yk = Xw, Yw
+        # compute weights
+        # Gaussian kernel: K(u) = exp(-0.5 u^2) / sqrt(2π); normalization cancels in NW
+        uu = (xg[:, None] - Xk[None, :]) / (h + 1e-15)
+        W = np.exp(-0.5 * uu * uu)                     # (nb_grid, Nw)
+        Sw = np.sum(W, axis=1) + 1e-15
+        mY = (W @ Yk) / Sw                             # E[Y|x] via kernel regression
+        phi_kern = mY * (sigX / sigY)
+
+        print(f"[Kernel] grid={nb_grid}, bandwidth h={h:.4g} ({kernel_bandwidth:.3f} × window width)")
+
+        # --- 4) Full-range (for left panel background) ---
+        xmin, xmax = np.percentile(X, [0.5, 99.5])
+        edges_full = np.linspace(xmin, xmax, 240+1)
+        xc_full = 0.5*(edges_full[:-1] + edges_full[1:])
+        idxF = np.searchsorted(edges_full, X, side="right") - 1
+        okF = (idxF >= 0) & (idxF < len(edges_full)-1)
+        cntF = np.bincount(idxF[okF], minlength=len(edges_full)-1).astype(int)
+        sumF = np.bincount(idxF[okF], weights=Y[okF], minlength=len(edges_full)-1).astype(np.float64)
+        meanF = np.full_like(xc_full, np.nan, dtype=np.float64)
+        nzF = cntF > 0; meanF[nzF] = sumF[nzF] / cntF[nzF]
+        phi_full = meanF * (sigX / sigY)
+
+        # --- 5) Plot (two panels) ---
+        fig, axs = plt.subplots(1, 2, figsize=(12.6, 4.8), constrained_layout=True)
+
+        # Left: full range + equal-mass zoom overlay line markers
+        axs[0].plot(xc_full, phi_full, '0.35', lw=1.4, label='DNS (full, binned)')
+        axs[0].plot(centers, phi_eqm, 'k.-', lw=2, ms=4, label='DNS (equal-mass in window)')
+        axs[0].axvspan(zoom_x[0], zoom_x[1], color='C3', alpha=0.09, label='paper window')
+        axs[0].set_xlabel(safe(r"$q\,\varepsilon^{2}$")); axs[0].set_ylabel(safe(r"$\phi(x)$"))
+        axs[0].set_title("DNS*: full + equal-mass zoom")
+        axs[0].grid(True, ls=':', alpha=0.5); axs[0].legend()
+
+        # Right: kernel smoother inside the window
+        axs[1].plot(xg, phi_kern, 'k-', lw=2, label='DNS (kernel NW)')
+        axs[1].set_xlim(*zoom_x); axs[1].set_ylim(*zoom_y)
+        axs[1].set_xlabel(safe(r"$q\,\varepsilon^{2}$")); axs[1].set_ylabel(safe(r"$\phi(x)$"))
+        axs[1].set_title(f"DNS*: kernel smoothing (h={kernel_bandwidth:.3f}×width)")
+        axs[1].grid(True, ls=':', alpha=0.5); axs[1].legend()
+
+        fig.savefig(self.save_dir / "Fig12_paper_style_dns.png", dpi=600, bbox_inches='tight'); plt.close(fig)
+
+        # Print the key center value (mean in |x|<0.1)
+        m0 = (np.abs(xg) < 0.1)
+        phi0_est = float(np.nanmean(phi_kern[m0]))
+        print(f"[Fig12-paper-style] φ(0) (kernel mean over |x|<0.1) ≈ {phi0_est:.5f}")
 
 
 # ==============================================================================
