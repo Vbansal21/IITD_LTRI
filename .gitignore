@@ -1,1 +1,11 @@
 **/run_2*
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.db
+*.sqlite3
+.DS_Store
+.history/
