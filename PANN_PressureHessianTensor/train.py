@@ -6,7 +6,6 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
 import warnings
 import datetime, pathlib
 import scipy.io
@@ -14,6 +13,7 @@ import pandas as pd
 import os
 import argparse
 import glob
+import collections
 from pathlib import Path
 
 # --- Put once at top of your module (before plt imports) ---
@@ -32,7 +32,12 @@ plt.rcParams.update({
 warnings.filterwarnings('ignore')
 torch.manual_seed(42)
 np.random.seed(42)
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
+torch.set_float32_matmul_precision("medium")
+# torch.backends.opt_einsum.enabled = False
+# torch.backends.opt_einsum.strategy = 'auto'
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ==============================================================================
@@ -58,6 +63,74 @@ def process_ground_truth_Q(Q, epsilon):
     psi = torch.sqrt(psi_sq + 1e-16)
     Q_hat_prime = Q_prime / psi
     return Q_prime, Q_hat_prime, psi.squeeze()
+
+def normalize_strain_tensor(A, epsilon):
+    """Return s = sym(a) with a = A / ||A||, guarding against 0-norm tensors."""
+    eps_matrix = epsilon.unsqueeze(-1).unsqueeze(-1)
+    a_norm = A / (eps_matrix + 1e-16)
+    s_norm = 0.5 * (a_norm + a_norm.transpose(1, 2))
+    return s_norm
+
+def compute_tbnn_invariants_and_bases(s_input, w_input):
+    """Compute scalar invariants λ₁…λ₅ and tensor bases T₁…T₁₀ for the TBNN."""
+    s_sq = torch.matmul(s_input, s_input)
+    w_sq = torch.matmul(w_input, w_input)
+    lambda_1 = torch.diagonal(s_sq, dim1=-2, dim2=-1).sum(-1)
+    lambda_2 = torch.diagonal(w_sq, dim1=-2, dim2=-1).sum(-1)
+    s_cubed = torch.matmul(s_sq, s_input)
+    lambda_3 = torch.diagonal(s_cubed, dim1=-2, dim2=-1).sum(-1)
+    w_sq_s = torch.matmul(w_sq, s_input)
+    lambda_4 = torch.diagonal(w_sq_s, dim1=-2, dim2=-1).sum(-1)
+    w_sq_s_sq = torch.matmul(w_sq, s_sq)
+    lambda_5 = torch.diagonal(w_sq_s_sq, dim1=-2, dim2=-1).sum(-1)
+    invariants = torch.stack([lambda_1, lambda_2, lambda_3, lambda_4, lambda_5], dim=1)
+
+    eye = torch.eye(3, device=s_input.device, dtype=s_input.dtype).unsqueeze(0).expand_as(s_input)
+    T1 = s_input
+    T2 = torch.matmul(s_input, w_input) - torch.matmul(w_input, s_input)
+    T3 = s_sq - torch.diagonal(s_sq, dim1=-2, dim2=-1).sum(-1).view(-1, 1, 1) / 3.0 * eye
+    T4 = w_sq - torch.diagonal(w_sq, dim1=-2, dim2=-1).sum(-1).view(-1, 1, 1) / 3.0 * eye
+    T5 = torch.matmul(w_input, s_sq) - torch.matmul(s_sq, w_input)
+    sw2 = torch.matmul(s_input, w_sq)
+    w2s = torch.matmul(w_sq, s_input)
+    T6 = w2s + sw2 - 2.0 / 3.0 * torch.diagonal(sw2, dim1=-2, dim2=-1).sum(-1).view(-1, 1, 1) * eye
+    ws = torch.matmul(w_input, s_input)
+    sw = torch.matmul(s_input, w_input)
+    T7 = torch.matmul(ws, w_sq) - torch.matmul(w_sq, sw)
+    s2w = torch.matmul(s_sq, w_input)
+    T8 = torch.matmul(sw, s_sq) - torch.matmul(s_sq, ws)
+    w2s2 = torch.matmul(w_sq, s_sq)
+    s2w2 = torch.matmul(s_sq, w_sq)
+    T9 = w2s2 + s2w2 - 2.0 / 3.0 * torch.diagonal(s2w2, dim1=-2, dim2=-1).sum(-1).view(-1, 1, 1) * eye
+    ws2 = torch.matmul(w_input, s_sq)
+    T10 = torch.matmul(ws2, w_sq) - torch.matmul(w_sq, s2w)
+    tensor_bases = torch.stack([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], dim=1)
+    return invariants, tensor_bases
+
+class Shakeout(nn.Module):
+    """
+    Shakeout regularisation (generalised dropout) that replaces dropped units with
+    ±alpha noise instead of zeros. See: Zhang & Xie, "Shakeout: A New Regularized
+    Deep Neural Network Training Scheme".
+    """
+    def __init__(self, p: float = 0.5, alpha: float = 0.0):
+        super().__init__()
+        if not 0.0 <= p <= 1.0:
+            raise ValueError("Shakeout drop probability p must be in [0, 1].")
+        self.p = p
+        self.alpha = alpha
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return input
+        device = input.device
+        keep_mask = torch.empty_like(input, device=device).bernoulli_(1.0 - self.p)
+        drop_mask = 1.0 - keep_mask
+        if self.alpha == 0.0:
+            noise = torch.zeros_like(input, device=device)
+        else:
+            noise = torch.empty_like(input, device=device).bernoulli_(0.5).mul_(2.0).sub_(1.0) * self.alpha
+        return input * keep_mask + noise * drop_mask
 
 def ema(arr, alpha=0.15):
     arr = np.asarray(arr, dtype=np.float64)
@@ -108,13 +181,13 @@ def hexbin_with_mean(ax, x, y, c=None, gridsize=200, cmap="jet", vmin=0.0, vmax=
 # ==============================================================================
 
 class MatlabDataset(torch.utils.data.Dataset):
-    def __init__(self, vel_grad_path, pressure_hessian_path):
+    def __init__(self, vel_grad_path, pressure_hessian_path, build_cache: bool = True):
         print(f"Loading data from {vel_grad_path} and {pressure_hessian_path}...")
         
         def load_mat_data(path):
             mat = scipy.io.loadmat(path)
             key = next(k for k in mat if k not in ('__header__', '__version__', '__globals__'))
-            return mat[key].astype(np.float64)
+            return mat[key].astype(np.float32)
 
         vel_grad_data = load_mat_data(vel_grad_path)
         if vel_grad_data.shape[0] == 9:
@@ -132,126 +205,190 @@ class MatlabDataset(torch.utils.data.Dataset):
         assert self.A.shape[0] == self.Q.shape[0], "Data sample counts do not match."
         self.num_samples = self.A.shape[0]
         print(f"Data loaded successfully. Found {self.num_samples} samples.")
+        self.cache = {}
+        if build_cache:
+            self._build_feature_cache()
 
     def __len__(self): return self.num_samples
-    def __getitem__(self, idx): return self.A[idx], self.Q[idx]
-    def get_full_dataset(self):
-        """Returns the full tensors for A and Q."""
+
+    def __getitem__(self, idx):
+        if not self.cache:
+            return self.A[idx], self.Q[idx]
+        sample = {
+            'A': self.A[idx],
+            'Q': self.Q[idx],
+            'epsilon': self.cache['epsilon'][idx],
+            's_norm': self.cache['s_norm'][idx],
+            'w': self.cache['w'][idx],
+            'invariants': self.cache['invariants'][idx],
+            'tensor_bases': self.cache['tensor_bases'][idx],
+            'q': self.cache['q'][idx],
+            'r': self.cache['r'][idx],
+            'Q_prime': self.cache['Q_prime'][idx],
+            'Q_hat': self.cache['Q_hat'][idx],
+            'psi': self.cache['psi'][idx],
+            'eig_s': self.cache['eig_s'][idx],
+            'eig_Q_true': self.cache['eig_Q_true'][idx]
+        }
+        return sample
+
+    def get_full_dataset(self, with_cache: bool = False):
+        """Returns the full tensors for A and Q (and cache if requested)."""
+        if with_cache:
+            return self.A, self.Q, self.cache
         return self.A, self.Q
+
+    def _build_feature_cache(self):
+        print("Precomputing tensor invariants and auxiliary quantities...")
+        with torch.no_grad():
+            s_raw, w_raw, epsilon, q_scalar, r_scalar = get_tensor_derivatives(self.A)
+            s_norm = normalize_strain_tensor(self.A, epsilon)
+            invariants, tensor_bases = compute_tbnn_invariants_and_bases(s_norm, w_raw)
+            Q_prime, Q_hat_prime, psi = process_ground_truth_Q(self.Q, epsilon)
+            _, eig_s_vecs = torch.linalg.eigh(s_norm)           # ascending γ,β,α
+            _, eig_Q_true_vecs = torch.linalg.eigh(Q_hat_prime) # ascending γ,β,α
+
+        self.cache = {
+            'epsilon': epsilon.contiguous(),
+            's_norm': s_norm.contiguous(),
+            'w': w_raw.contiguous(),
+            'invariants': invariants.contiguous(),
+            'tensor_bases': tensor_bases.contiguous(),
+            'q': q_scalar.contiguous(),
+            'r': r_scalar.contiguous(),
+            'Q_prime': Q_prime.contiguous(),
+            'Q_hat': Q_hat_prime.contiguous(),
+            'psi': psi.contiguous(),
+            'eig_s': eig_s_vecs.contiguous(),
+            'eig_Q_true': eig_Q_true_vecs.contiguous()
+        }
+        print("Precomputation complete. Cached keys:", ", ".join(sorted(self.cache.keys())))
 
 # ==============================================================================
 # 3. MODEL DEFINITIONS (With Hard Symmetry Constraint)
 # ==============================================================================
 
 class TBNN_Q_direction(nn.Module):
-    def __init__(self, hidden_layers=[50, 100, 100, 100, 50], dropout_p=0.1):
+    def __init__(self, hidden_layers=[50, 100, 100, 100, 50], dropout_p=0.1,
+                 dropout_type: str = 'dropout', shakeout_alpha: float = 0.0):
         super().__init__()
-        layers = []; input_dim = 5
+        input_dim = 5
+        self.linears = nn.ModuleList()
+        self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.1))
-            layers.append(nn.Dropout(dropout_p))
+            self.linears.append(nn.Linear(input_dim, hidden_dim))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.9))
             input_dim = hidden_dim
-        layers.append(nn.Linear(input_dim, 10))
-        self.network = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(input_dim, 10)
+        self.activation = nn.LeakyReLU(0.1)
+        drop_kind = (dropout_type or 'dropout').strip().lower()
+        if dropout_p <= 0.0:
+            self.dropout = nn.Identity()
+        elif drop_kind == 'shakeout':
+            self.dropout = Shakeout(dropout_p, shakeout_alpha)
+        else:
+            self.dropout = nn.Dropout(dropout_p)
+        self._init_weights()
 
-    def forward(self, s, w):
-        s_sq = torch.einsum('bik,bkj->bij', s, s); w_sq = torch.einsum('bik,bkj->bij', w, w)
-        lambda_1 = torch.einsum('bii->b', s_sq); lambda_2 = torch.einsum('bii->b', w_sq)
-        s_cubed = torch.einsum('bik,bkj->bij', s_sq, s); lambda_3 = torch.einsum('bii->b', s_cubed)
-        w_sq_s = torch.einsum('bik,bkj->bij', w_sq, s); lambda_4 = torch.einsum('bii->b', w_sq_s)
-        w_sq_s_sq = torch.einsum('bik,bkj->bij', w_sq, s_sq); lambda_5 = torch.einsum('bii->b', w_sq_s_sq)
-        invariants = torch.stack([lambda_1, lambda_2, lambda_3, lambda_4, lambda_5], dim=1)
-        T = self._compute_tensor_bases(s, w, s_sq, w_sq)
-        g = self.network(invariants)
-        Q_hat_prime_pred = torch.einsum('bn,bnij->bij', g, T)
+    def forward(self, s, w, invariants=None, tensor_bases=None, return_penalty: bool = False):
+        if invariants is None or tensor_bases is None:
+            invariants, tensor_bases = compute_tbnn_invariants_and_bases(s, w)
+        x = invariants
+        for linear, bn in zip(self.linears, self.bns):
+            x = linear(x)
+            x = self.activation(x)
+            x = bn(x)
+            x = self.dropout(x)
+        g = self.output_layer(x)
+        Q_hat_raw = torch.einsum('bn,bnij->bij', g, tensor_bases)
 
-        raw_pred = Q_hat_prime_pred
+        sym_penalty = None
+        if return_penalty:
+            antisym = 0.5 * (Q_hat_raw - Q_hat_raw.transpose(-2, -1))
+            sym_penalty = torch.mean(torch.sum(antisym * antisym, dim=(1, 2)))
 
-        I3 = torch.eye(3, device=Q_hat_prime_pred.device, dtype=Q_hat_prime_pred.dtype)
-        trace = torch.einsum('bii->b', Q_hat_prime_pred)
-        Q_hat_prime_pred = Q_hat_prime_pred - trace[:, None, None] * I3 / 3.0
+        Q_hat_sym = 0.5 * (Q_hat_raw + Q_hat_raw.transpose(-2, -1))
+        eye = torch.eye(3, device=Q_hat_sym.device, dtype=Q_hat_sym.dtype).unsqueeze(0)
+        trace = torch.diagonal(Q_hat_sym, dim1=-2, dim2=-1).sum(-1, keepdim=True) / 3.0
+        Q_hat_traceless = Q_hat_sym - trace.unsqueeze(-1) * eye
+        norm = torch.sqrt(torch.sum(Q_hat_traceless * Q_hat_traceless, dim=(1, 2), keepdim=True) + 1e-12)
+        Q_hat_prime_pred = Q_hat_traceless / norm
+        if return_penalty:
+            return Q_hat_prime_pred, sym_penalty
+        return Q_hat_prime_pred
 
-        Q_hat_prime_pred = 0.5 * (Q_hat_prime_pred + Q_hat_prime_pred.transpose(-2, -1))
-
-        norm_Q_pred_sq = torch.sum(Q_hat_prime_pred**2, dim=(1, 2), keepdim=True)
-        norm_Q_pred = torch.sqrt(norm_Q_pred_sq + 1e-16)
-        return Q_hat_prime_pred / norm_Q_pred, raw_pred
-
-    def set_dropout_p(self, p: float):
-        p_clamped = float(np.clip(p, 0.0, 1.0))
-        for module in self.network:
-            if isinstance(module, nn.Dropout):
-                module.p = p_clamped
-
-    def _compute_tensor_bases(self, s, w, s_sq, w_sq):
-        I = torch.eye(3, device=s.device, dtype=s.dtype).unsqueeze(0).expand(s.shape[0], -1, -1)
-        T1 = s; T2 = torch.einsum('bik,bkj->bij', s, w) - torch.einsum('bik,bkj->bij', w, s)
-        T3 = s_sq - torch.einsum('bii->b', s_sq).view(-1, 1, 1) / 3 * I
-        T4 = w_sq - torch.einsum('bii->b', w_sq).view(-1, 1, 1) / 3 * I
-        T5 = torch.einsum('bik,bkj->bij', w, s_sq) - torch.einsum('bik,bkj->bij', s_sq, w)
-        sw2 = torch.einsum('bik,bkj->bij', s, w_sq); w2s = torch.einsum('bik,bkj->bij', w_sq, s)
-        T6 = w2s + sw2 - 2./3. * torch.einsum('bii->b', sw2).view(-1, 1, 1) * I
-        
-        ws = torch.einsum('bik,bkj->bij', w, s)
-        sw = torch.einsum('bik,bkj->bij', s, w)
-        T7 = torch.einsum('bik,bkj->bij', ws, w_sq) - torch.einsum('bik,bkj->bij', w_sq, sw)
-        s2w = torch.einsum('bik,bkj->bij', s_sq, w)
-        T8 = torch.einsum('bik,bkj->bij', sw, s_sq) - torch.einsum('bik,bkj->bij', s_sq, ws)
-        w2s2 = torch.einsum('bik,bkj->bij', w_sq, s_sq)
-        s2w2 = torch.einsum('bik,bkj->bij', s_sq, w_sq)
-        T9 = w2s2 + s2w2 - 2./3. * torch.einsum('bii->b', s2w2).view(-1,1,1) * I
-        ws2 = torch.einsum('bik,bkj->bij', w, s_sq)
-        T10 = torch.einsum('bik,bkj->bij', ws2, w_sq) - torch.einsum('bik,bkj->bij', w_sq, s2w)
-        
-        return torch.stack([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], dim=1)
+    def _init_weights(self):
+        for idx, linear in enumerate(self.linears):
+            nn.init.kaiming_uniform_(linear.weight, a=0.1, nonlinearity='leaky_relu')
+            nn.init.zeros_(linear.bias)
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
 
 class FCNN_psi_magnitude(nn.Module):
-    def __init__(self, hidden_layers=[50, 80, 50], dropout_p=0.1):
+    def __init__(self, hidden_layers=[50, 80, 50], dropout_p=0.1,
+                 dropout_type: str = 'dropout', shakeout_alpha: float = 0.0):
         super().__init__()
-        layers = []; input_dim = 2
+        input_dim = 2
+        self.linears = nn.ModuleList()
+        self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.1))
-            layers.append(nn.Dropout(dropout_p))
+            self.linears.append(nn.Linear(input_dim, hidden_dim))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.9))
             input_dim = hidden_dim
-        layers.append(nn.Linear(input_dim, 1))
-        self.network = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(input_dim, 1)
+        self.activation = nn.LeakyReLU(0.1)
+        drop_kind = (dropout_type or 'dropout').strip().lower()
+        if dropout_p <= 0.0:
+            self.dropout = nn.Identity()
+        elif drop_kind == 'shakeout':
+            self.dropout = Shakeout(dropout_p, shakeout_alpha)
+        else:
+            self.dropout = nn.Dropout(dropout_p)
+        self._init_weights()
+
     def forward(self, q, r):
         inputs = torch.stack([q, r], dim=1)
-        # return F.relu(self.network(inputs).squeeze())
-        return nn.LeakyReLU(0.1)(self.network(inputs).squeeze())
-        # return self.network(inputs).squeeze()
+        x = inputs
+        for linear, bn in zip(self.linears, self.bns):
+            x = linear(x)
+            x = self.activation(x)
+            x = bn(x)
+            x = self.dropout(x)
+        return self.output_layer(x).squeeze()
 
-    def set_dropout_p(self, p: float):
-        p_clamped = float(np.clip(p, 0.0, 1.0))
-        for module in self.network:
-            if isinstance(module, nn.Dropout):
-                module.p = p_clamped
+    def _init_weights(self):
+        for linear in self.linears:
+            nn.init.kaiming_uniform_(linear.weight, a=0.1, nonlinearity='leaky_relu')
+            nn.init.zeros_(linear.bias)
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
 
 # ==============================================================================
 # 4. LOSS FUNCTIONS (With Physics Constraints and Log-Cosh)
 # ==============================================================================
-def euler_angle_loss(Q_hat_prime_pred, Q_hat_prime_true, s_true):
+def euler_angle_loss(Q_hat_prime_pred, Q_hat_prime_true, s_true, precomputed=None):
     try:
-        # e_s_vecs: (batch,3,3) real orthogonal matrix with columns being eigenvectors
-        # of s_true in ascending eigenvalue order, i.e., [λ₁≤λ₂≤λ₃] from
-        # torch.linalg.eigh(). Used for calculating strain-rate eigenframe alignment.
-        _, e_s_vecs = torch.linalg.eigh(s_true)
-        e_gamma_s, e_beta_s, e_alpha_s = e_s_vecs[:,:,0], e_s_vecs[:,:,1], e_s_vecs[:,:,2]
-        
-        _, e_p_vecs_true = torch.linalg.eigh(Q_hat_prime_true)
-        e_gamma_p_true, e_beta_p_true, e_alpha_p_true = e_p_vecs_true[:,:,0], e_p_vecs_true[:,:,1], e_p_vecs_true[:,:,2]
+        if precomputed is not None and 's_eigvecs' in precomputed:
+            e_s_vecs = precomputed['s_eigvecs']
+        else:
+            _, e_s_vecs = torch.linalg.eigh(s_true)
+        e_gamma_s, e_beta_s, e_alpha_s = e_s_vecs[:, :, 0], e_s_vecs[:, :, 1], e_s_vecs[:, :, 2]
+
+        if precomputed is not None and 'Q_hat_true_eigvecs' in precomputed:
+            e_p_vecs_true = precomputed['Q_hat_true_eigvecs']
+        else:
+            _, e_p_vecs_true = torch.linalg.eigh(Q_hat_prime_true)
+        e_gamma_p_true, e_beta_p_true, e_alpha_p_true = e_p_vecs_true[:, :, 0], e_p_vecs_true[:, :, 1], e_p_vecs_true[:, :, 2]
         _, e_p_vecs_pred = torch.linalg.eigh(Q_hat_prime_pred)
-        e_gamma_p_pred, e_beta_p_pred, e_alpha_p_pred = e_p_vecs_pred[:,:,0], e_p_vecs_pred[:,:,1], e_p_vecs_pred[:,:,2]
-        
+        e_gamma_p_pred, e_beta_p_pred, e_alpha_p_pred = e_p_vecs_pred[:, :, 0], e_p_vecs_pred[:, :, 1], e_p_vecs_pred[:, :, 2]
+
         cos_zeta_true = torch.einsum('bi,bi->b', e_gamma_p_true, e_gamma_s)
         e_proj_prime_true = e_alpha_p_true - torch.einsum('bi,bi->b', e_alpha_p_true, e_gamma_s).unsqueeze(1) * e_gamma_s
         e_proj_true = e_proj_prime_true / (torch.norm(e_proj_prime_true, dim=1, keepdim=True) + 1e-8)
         cos_theta_true = torch.einsum('bi,bi->b', e_alpha_s, e_proj_true)
         e_norm_true = torch.cross(e_proj_true, e_gamma_s)
         cos_eta_true = torch.einsum('bi,bi->b', e_beta_p_true, e_norm_true)
-        
+
         cos_zeta_pred = torch.einsum('bi,bi->b', e_gamma_p_pred, e_gamma_s)
         e_proj_prime_pred = e_alpha_p_pred - torch.einsum('bi,bi->b', e_alpha_p_pred, e_gamma_s).unsqueeze(1) * e_gamma_s
         e_proj_pred = e_proj_prime_pred / (torch.norm(e_proj_prime_pred, dim=1, keepdim=True) + 1e-8)
@@ -274,55 +411,6 @@ def euler_angle_loss(Q_hat_prime_pred, Q_hat_prime_true, s_true):
     except torch.linalg.LinAlgError:
         return torch.tensor(0.0, device=Q_hat_prime_pred.device, requires_grad=True), {}
 
-def log_cosh_loss(y_pred, y_true):
-    err = y_true - y_pred
-    return torch.mean(torch.log(torch.cosh(err) + 1e-12))
-
-def symmetry_loss(raw_pred_tensor):
-    return torch.mean((raw_pred_tensor - raw_pred_tensor.transpose(-2, -1))**2)
-
-# ==============================================================================
-# Dropout scheduling utilities
-# ==============================================================================
-class DropoutScheduler:
-    """Utility to update dropout probabilities during training."""
-    def __init__(self, config: dict | None, total_epochs: int):
-        cfg = dict(config or {})
-        schedule_type = cfg.get('type', 'constant').lower()
-        alias_map = {'anealingcosinedecay': 'annealingcosinedecay'}
-        schedule_type = alias_map.get(schedule_type, schedule_type)
-        self.schedule_type = schedule_type
-        self.total_epochs = max(1, int(total_epochs))
-        self.initial = float(cfg.get('initial', cfg.get('value', 0.1)))
-        self.final = float(cfg.get('final', self.initial))
-        self.warmup_epochs = int(cfg.get('warmup_epochs', 0))
-        self.min_p = float(cfg.get('min', 0.0))
-        self.max_p = float(cfg.get('max', 1.0))
-        if self.min_p > self.max_p:
-            self.min_p, self.max_p = self.max_p, self.min_p
-        valid_modes = {'constant', 'annealingcosinedecay', 'annealing_cosine', 'cosine', 'linear'}
-        if self.schedule_type not in valid_modes:
-            raise ValueError(f"Unsupported dropout schedule '{schedule_type}'. Valid options: {valid_modes}")
-
-    def value(self, epoch_idx: int) -> float:
-        epoch = max(0, int(epoch_idx))
-        base_value: float
-        if self.schedule_type == 'constant':
-            base_value = self.initial
-        elif self.schedule_type in {'annealingcosinedecay', 'annealing_cosine', 'cosine'}:
-            adjusted_total = max(self.total_epochs - self.warmup_epochs, 1)
-            if epoch < self.warmup_epochs:
-                base_value = self.initial
-            else:
-                progress = min(epoch - self.warmup_epochs, adjusted_total)
-                cosine_term = 0.5 * (1 + math.cos(math.pi * progress / adjusted_total))
-                base_value = self.final + (self.initial - self.final) * cosine_term
-        else:  # linear schedule
-            total = max(self.total_epochs - 1, 1)
-            progress = min(epoch, total) / total
-            base_value = self.initial + (self.final - self.initial) * progress
-        return float(np.clip(base_value, self.min_p, self.max_p))
-
 # ==============================================================================
 # 5. TRAINING PIPELINE (FP64, Grad Clipping)
 # ==============================================================================
@@ -332,67 +420,77 @@ class AIBMTrainer:
                 grad_clip_value=5.0, symm_loss_weight=0.5,
                 print_every=1, metrics_save_path=None,
                 ema_smoothing=0.15, log_header_interval=100,
-                optimizer_betas=(0.95, 0.9995), optimizer_weight_decay=1e-2,
-                optimizer_eps=1e-8, dropout_schedule_config=None,
-                snapshot_dir=None):
+                dropout_p=0.1, lr_scheduler_type='linear', warmup_epochs=10,
+                snapshot_dir=None, log_interval_type='epoch',
+                log_interval_seconds=60.0, enable_profiler=True,
+                compile_models=False):
         self.epochs = epochs
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model_Q = model_Q.to(self.device, dtype=torch.float64)
-        self.model_psi = model_psi.to(self.device, dtype=torch.float64)
+        self.train_dtype = torch.float64
+        self.model_Q = model_Q.to(self.device, dtype=self.train_dtype)
+        self.model_psi = model_psi.to(self.device, dtype=self.train_dtype)
+        self._compiled = False
+        if compile_models and hasattr(torch, "compile"):
+            try:
+                self.model_Q = torch.compile(self.model_Q)
+                self.model_psi = torch.compile(self.model_psi)
+                self._compiled = True
+            except Exception as compile_err:
+                warnings.warn(f"torch.compile failed ({compile_err}); continuing without compilation.", stacklevel=2)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        if len(optimizer_betas) != 2:
-            raise ValueError("optimizer_betas must be a tuple of length 2.")
-        self.optimizer_Q = torch.optim.AdamW(
-            self.model_Q.parameters(),
-            lr=learning_rate_Q,
-            betas=optimizer_betas,
-            weight_decay=optimizer_weight_decay,
-            eps=optimizer_eps
-        )
-        self.optimizer_psi = torch.optim.AdamW(
-            self.model_psi.parameters(),
-            lr=learning_rate_psi,
-            betas=optimizer_betas,
-            weight_decay=optimizer_weight_decay,
-            eps=optimizer_eps
-        )
-        self.scheduler_Q = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_Q, T_max=epochs, eta_min=learning_rate_Q/25)
-        self.scheduler_psi = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer_psi, T_max=epochs, eta_min=learning_rate_psi/25)
+        self.optimizer_Q = torch.optim.Adamax(self.model_Q.parameters(), lr=learning_rate_Q)
+        self.optimizer_psi = torch.optim.Adamax(self.model_psi.parameters(), lr=learning_rate_psi)
+        self.scheduler_type = lr_scheduler_type.strip().lower().replace(' ', '_')
+        if self.scheduler_type in {'warmup_cosine_decay', 'warmup-cosine-decay'}:
+            self.scheduler_type = 'warmup_cosine'
+        self.warmup_epochs = int(max(0, warmup_epochs))
+        self.scheduler_Q = self._build_scheduler(self.optimizer_Q)
+        self.scheduler_psi = self._build_scheduler(self.optimizer_psi)
         self.grad_clip_value = grad_clip_value
-        self.symm_loss_weight = symm_loss_weight
-        self.print_every = print_every
+        self.symm_loss_weight = float(symm_loss_weight)
+        interval = (log_interval_type or 'epoch').strip().lower()
+        if interval in {'epoch', 'epochs'}:
+            self.log_interval_type = 'epoch'
+        elif interval in {'time', 'seconds', 'wall', 'wall_time'}:
+            self.log_interval_type = 'time'
+        else:
+            warnings.warn(f"Unknown log_interval_type '{log_interval_type}', defaulting to 'epoch'.")
+            self.log_interval_type = 'epoch'
+        self.print_every = max(1, int(print_every))
+        self.log_interval_seconds = max(0.0, float(log_interval_seconds))
         self.metrics_save_path = metrics_save_path
         self.history = []
         self.train_metrics = []
         self.val_metrics = []
         self.best = {}
         self.snapshot_dir = str(snapshot_dir) if snapshot_dir else None
-        self.dropout_scheduler = DropoutScheduler(dropout_schedule_config, self.epochs)
-        self.current_dropout_p = self.dropout_scheduler.value(0)
-        self._apply_dropout(self.current_dropout_p)
+        self.dropout_p = float(dropout_p)
+        self._set_model_dropout(self.dropout_p)
 
         # For EMA smoothing and logging
         self.ema_alpha = ema_smoothing
         self.log_header_interval = max(1, log_header_interval)
         self._log_line_count = 0
+        self._last_log_time = None
+        self.enable_profiler = bool(enable_profiler)
 
     def train(self, epochs=None):
         epochs = epochs if epochs else self.epochs
         header = (
-            f"{'Epoch':>5} | {'train_euler':>13} | {'val_euler':>13} | "
-            f"{'train_psi_rmse':>16} | {'val_psi_rmse':>16} | "
-            f"{'ratio':>8} | {'t_train(s)':>11} | {'t_val(s)':>11} | {'t_total(s)':>11}"
+            f"{'Epoch':>5} | {'train_euler':>11} | {'val_euler':>11} | "
+            f"{'train_psi_RMSE':>16} | {'val_psi_RMSE':>16} | "
+            f"{'t_epoch(s)':>12}"
         )
         print('\n' + header)
         print('-' * len(header))
         import time
+        self._last_log_time = None
+        if self._compiled:
+            print("[info] torch.compile enabled for model_Q/model_psi")
 
         for epoch in range(epochs):
             epoch_idx = epoch + 1
-
-            current_dropout = self.dropout_scheduler.value(epoch_idx - 1)
-            self._apply_dropout(current_dropout)
 
             # ---------- Training ----------
             self.model_Q.train()
@@ -406,8 +504,7 @@ class AIBMTrainer:
                 **train_stats,
                 'lr_Q': current_lr_Q,
                 'lr_psi': current_lr_psi,
-                'time': train_time,
-                'dropout_p': current_dropout
+                'time': train_time
             }
 
             # ---------- Validation ----------
@@ -417,11 +514,13 @@ class AIBMTrainer:
                 val_start = time.time()
                 val_stats = self._epoch_pass(self.val_loader, mode='val')
                 val_time = time.time() - val_start
-            val_stats = {**val_stats, 'time': val_time, 'dropout_p': current_dropout}
+            val_stats = {**val_stats, 'time': val_time}
 
             # ---------- Scheduler (per-epoch) ----------
-            self.scheduler_Q.step()
-            self.scheduler_psi.step()
+            if self.scheduler_Q:
+                self.scheduler_Q.step()
+            if self.scheduler_psi:
+                self.scheduler_psi.step()
 
             # ---------- Record ----------
             flat_record = {'epoch': epoch_idx}
@@ -431,31 +530,30 @@ class AIBMTrainer:
             self.train_metrics.append({'epoch': epoch_idx, **train_stats})
             self.val_metrics.append({'epoch': epoch_idx, **val_stats})
 
-            ratio = val_stats['euler'] / train_stats['euler'] if train_stats['euler'] != 0 else float('nan')
-            train_time = train_stats['time']
-            val_time = val_stats['time']
-            total_time = train_time + val_time
+            total_time = train_stats['time'] + val_stats['time']
+            now = time.time()
+            train_psi_rmse = train_stats.get('psi_rmse', float('nan'))
+            val_psi_rmse = val_stats.get('psi_rmse', float('nan'))
 
-            if (epoch_idx % self.print_every == 0) or (epoch == 0):
+            if self._should_log(epoch_idx, now):
                 if self._log_line_count % self.log_header_interval == 0 and self._log_line_count != 0:
                     print('\n' + header)
                     print('-' * len(header))
                 print(
                     f"{epoch_idx:5d} | "
-                    f"{self._format_sci(train_stats['euler']):>13} | "
-                    f"{self._format_sci(val_stats['euler']):>13} | "
-                    f"{self._format_sci(train_stats['psi_rmse']):>16} | "
-                    f"{self._format_sci(val_stats['psi_rmse']):>16} | "
-                    f"{self._format_sci(ratio):>8} | "
-                    f"{self._format_sci(train_time):>11} | "
-                    f"{self._format_sci(val_time):>11} | "
-                    f"{self._format_sci(total_time):>11}"
+                    f"{self._format_sci(train_stats['euler']):>11} | "
+                    f"{self._format_sci(val_stats['euler']):>11} | "
+                    f"{self._format_sci(train_psi_rmse):>16} | "
+                    f"{self._format_sci(val_psi_rmse):>16} | "
+                    f"{self._format_sci(total_time):>12}"
                 )
                 self._log_line_count += 1
+                self._last_log_time = now
 
             # ---------- Best tracking / snapshots ----------
             best_val_euler = self.best.get('euler', float('inf'))
-            if val_stats['euler'] < best_val_euler:
+            current_val_euler = val_stats['euler']
+            if not math.isnan(current_val_euler) and current_val_euler < best_val_euler:
                 self.best = {'epoch': epoch_idx, **val_stats}
                 if self.snapshot_dir:
                     self.save_snapshot(epoch_idx, val_stats, save_dir=self.snapshot_dir, tag='best')
@@ -466,6 +564,23 @@ class AIBMTrainer:
         if self.best:
             print("\nBest validation metrics (by Euler loss):")
             print(self.best)
+
+        if self.enable_profiler:
+            train_profiles = [m.get('profile_total') for m in self.train_metrics if isinstance(m.get('profile_total'), (int, float))]
+            val_profiles = [m.get('profile_total') for m in self.val_metrics if isinstance(m.get('profile_total'), (int, float))]
+            if train_profiles or val_profiles:
+                def _summary(arr):
+                    arr = [x for x in arr if x is not None and not math.isnan(x)]
+                    return (np.mean(arr), np.median(arr)) if arr else (float('nan'), float('nan'))
+                train_mean, train_med = _summary(train_profiles)
+                val_mean, val_med = _summary(val_profiles)
+                print("\nProfiler summary (seconds per epoch):")
+                print({
+                    'train_mean': self._format_sci(train_mean),
+                    'train_median': self._format_sci(train_med),
+                    'val_mean': self._format_sci(val_mean),
+                    'val_median': self._format_sci(val_med)
+                })
 
         # Save to DataFrame for later analysis
         self.history_df = pd.DataFrame(self.history)
@@ -484,99 +599,195 @@ class AIBMTrainer:
             return "inf" if value > 0 else "-inf"
         return f"{value:.2e}"
 
-    def _apply_dropout(self, p: float):
+    def _should_log(self, epoch_idx: int, current_time: float) -> bool:
+        if epoch_idx == 1:
+            return True
+        if self.log_interval_type == 'epoch':
+            return (epoch_idx % self.print_every) == 0
+        if self.log_interval_seconds <= 0.0:
+            return True
+        if self._last_log_time is None:
+            return True
+        return (current_time - self._last_log_time) >= self.log_interval_seconds
+
+    def _set_model_dropout(self, p: float):
         p = float(np.clip(p, 0.0, 1.0))
-        if hasattr(self.model_Q, 'set_dropout_p'):
-            self.model_Q.set_dropout_p(p)
+        for module in self.model_Q.modules():
+            if isinstance(module, (nn.Dropout, Shakeout)):
+                module.p = p
+        for module in self.model_psi.modules():
+            if isinstance(module, (nn.Dropout, Shakeout)):
+                module.p = p
+        self.dropout_p = p
+
+    def _build_scheduler(self, optimizer):
+        sched = self.scheduler_type
+        if sched == 'none':
+            return None
+        if sched == 'linear':
+            def lr_lambda(epoch):
+                if self.epochs <= 1:
+                    return 1.0
+                return max(0.0, 1.0 - (epoch / (self.epochs - 1)))
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        if sched == 'cosine':
+            return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=0.0)
+        if sched in {'warmup_cosine', 'warmup-cosine', 'warmup_cosine_decay', 'warmupcosine'}:
+            warmup = min(self.warmup_epochs, max(0, self.epochs - 1))
+            def lr_lambda(epoch):
+                if warmup > 0 and epoch < warmup:
+                    return float(epoch + 1) / float(warmup)
+                if self.epochs <= warmup + 1:
+                    return 1.0
+                progress = (epoch - warmup) / max(1, (self.epochs - warmup - 1))
+                progress = min(max(progress, 0.0), 1.0)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        raise ValueError(f"Unknown scheduler type '{self.scheduler_type}'. Choose from 'none', 'linear', 'cosine', 'warmup_cosine'.")
+
+    def _prepare_raw_batch(self, batch):
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            A_batch, Q_batch = batch
         else:
-            for module in self.model_Q.modules():
-                if isinstance(module, nn.Dropout):
-                    module.p = p
-        if hasattr(self.model_psi, 'set_dropout_p'):
-            self.model_psi.set_dropout_p(p)
-        else:
-            for module in self.model_psi.modules():
-                if isinstance(module, nn.Dropout):
-                    module.p = p
-        self.current_dropout_p = p
+            raise TypeError("Expected (A_batch, Q_batch) tuple when cache is unavailable.")
+        A_batch = A_batch.to(dtype=self.train_dtype)
+        Q_batch = Q_batch.to(dtype=self.train_dtype)
+        with torch.no_grad():
+            s_raw, w_raw, epsilon, q_vals, r_vals = get_tensor_derivatives(A_batch)
+            s_norm = normalize_strain_tensor(A_batch, epsilon)
+            invariants, tensor_bases = compute_tbnn_invariants_and_bases(s_norm, w_raw)
+            Q_prime, Q_hat_prime, psi = process_ground_truth_Q(Q_batch, epsilon)
+            _, eig_s_vecs = torch.linalg.eigh(s_norm)
+            _, eig_Q_true_vecs = torch.linalg.eigh(Q_hat_prime)
+        return {
+            's_norm': s_norm,
+            'w': w_raw,
+            'invariants': invariants,
+            'tensor_bases': tensor_bases,
+            'q': q_vals,
+            'r': r_vals,
+            'Q_prime': Q_prime,
+            'Q_hat': Q_hat_prime,
+            'psi': psi,
+            'eig_s': eig_s_vecs,
+            'eig_Q_true': eig_Q_true_vecs
+        }
 
     def _epoch_pass(self, loader, mode='train'):
-        losses_euler, losses_L1, losses_L2, losses_L3, losses_symm = [], [], [], [], []
-        rmse_Q, rmse_psi = [], []
+        psi_rmses = []
         psi_r2s = []
-        losses_psi, losses_psi_mse = [], []
-        N = 0
+        euler_losses, euler_L1, euler_L2, euler_L3 = [], [], [], []
+        symm_losses = []
+        profiler = collections.defaultdict(float) if self.enable_profiler else None
+        import time
 
-        for A_batch, Q_batch in loader:
-            A_batch = A_batch.to(self.device, dtype=torch.float64)
-            Q_batch = Q_batch.to(self.device, dtype=torch.float64)
+        for batch in loader:
+            sample = batch if isinstance(batch, dict) else self._prepare_raw_batch(batch)
 
-            s, w, eps, q, r = get_tensor_derivatives(A_batch)
-            _, Q_hat_t, psi_t = process_ground_truth_Q(Q_batch, eps)
-            a = A_batch / eps.unsqueeze(-1).unsqueeze(-1)
-            s_norm = 0.5 * (a + a.transpose(1, 2))
+            t_device = time.perf_counter()
+            s_norm = sample['s_norm'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            w = sample['w'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            invariants = sample['invariants'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            tensor_bases = sample['tensor_bases'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            q_vals = sample['q'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            r_vals = sample['r'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            Q_hat_t = sample['Q_hat'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            psi_t = sample['psi'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            eig_s = sample['eig_s'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            eig_Q_true = sample['eig_Q_true'].to(self.device, dtype=self.train_dtype, non_blocking=True)
+            if profiler is not None:
+                profiler['to_device'] += time.perf_counter() - t_device
+            t_forward = time.perf_counter()
+            Q_hat_p, sym_penalty = self.model_Q(s_norm, w, invariants=invariants, tensor_bases=tensor_bases, return_penalty=True)
+            psi_p = self.model_psi(q_vals, r_vals)
+            if profiler is not None:
+                profiler['forward'] += time.perf_counter() - t_forward
 
-            Q_hat_p, raw_Q_p = self.model_Q(s_norm, w)
-            psi_p = self.model_psi(q, r)
+            t_loss = time.perf_counter()
+            q_mse = F.mse_loss(Q_hat_p, Q_hat_t)
+            psi_mse = F.mse_loss(psi_p, psi_t)
+            q_rmse = torch.sqrt(q_mse + 1e-12)
+            psi_rmse = torch.sqrt(psi_mse + 1e-12)
 
-            # Euler angle and component losses
-            loss_euler, euler_dict = euler_angle_loss(Q_hat_p, Q_hat_t, s_norm)
-            loss_euler_raw, euler_dict_raw = euler_angle_loss(raw_Q_p, Q_hat_t, s_norm)
-            sym_loss = symmetry_loss(raw_Q_p)
+            precomp = {'s_eigvecs': eig_s, 'Q_hat_true_eigvecs': eig_Q_true}
+            loss_euler, euler_dict = euler_angle_loss(Q_hat_p, Q_hat_t, s_norm, precomputed=precomp)
 
-            losses_euler.append((loss_euler.detach().item() + loss_euler_raw.detach().item()) / 2)
-            losses_L1.append((euler_dict.get('L1', 0) + euler_dict_raw.get('L1', 0)) / 2)
-            losses_L2.append((euler_dict.get('L2', 0) + euler_dict_raw.get('L2', 0)) / 2)
-            losses_L3.append((euler_dict.get('L3', 0) + euler_dict_raw.get('L3', 0)) / 2)
-            losses_symm.append(sym_loss.detach().item())
+            finite_components = torch.stack([q_rmse, psi_rmse, loss_euler, sym_penalty])
+            if not torch.isfinite(finite_components).all():
+                warnings.warn("Non-finite loss components encountered; skipping batch.", stacklevel=2)
+                continue
 
-            # RMSE and R2
-            q_rmse = torch.sqrt(F.mse_loss(Q_hat_p, Q_hat_t))
-            mse_psi = F.mse_loss(psi_p, psi_t)
-            psi_rmse = torch.sqrt(mse_psi)
-            logcosh_loss_val = log_cosh_loss(psi_p, psi_t)
+            # q_scale = torch.clamp(torch.std(Q_hat_t.detach()), min=1e-6)
+            # psi_scale = torch.clamp(torch.std(psi_t.detach()), min=1e-6)
+            # euler_scale = torch.clamp(torch.std(torch.tensor([1.0, 1.0, 1.0], device=loss_euler.device, dtype=loss_euler.dtype)), min=1e-6)
+            total_loss = q_rmse + psi_rmse + loss_euler + (self.symm_loss_weight * sym_penalty)
+            if profiler is not None:
+                profiler['loss'] += time.perf_counter() - t_loss
 
-            rmse_Q.append(q_rmse.detach().item())
-            rmse_psi.append(psi_rmse.detach().item())
-            losses_psi.append(logcosh_loss_val.detach().item())
-            losses_psi_mse.append(mse_psi.detach().item())
-            psi_r2s.append(self._r2(psi_p, psi_t))
+            psi_rmses.append(float(psi_rmse.detach()))
+            r2_val = self._r2(psi_p, psi_t)
+            if math.isfinite(r2_val):
+                psi_r2s.append(r2_val)
 
-            N += 1
+            symm_losses.append(float(sym_penalty.detach()))
+            euler_losses.append(float(loss_euler.detach()))
+            euler_L1.append(euler_dict.get('L1', 0.0))
+            euler_L2.append(euler_dict.get('L2', 0.0))
+            euler_L3.append(euler_dict.get('L3', 0.0))
 
-            # Backprop only if train
             if mode == 'train':
                 self.optimizer_Q.zero_grad(set_to_none=True)
                 self.optimizer_psi.zero_grad(set_to_none=True)
 
-                total_q_loss = (loss_euler*np.exp(-N) + loss_euler_raw*np.exp(N))/(2*(np.exp(-N)+np.exp(N))) + self.symm_loss_weight * sym_loss
-                total_q_loss.backward()
-                logcosh_loss_val.backward()
+                t_backward = time.perf_counter()
+                total_loss.backward()
+                if profiler is not None:
+                    profiler['backward'] += time.perf_counter() - t_backward
 
+                t_opt = time.perf_counter()
                 torch.nn.utils.clip_grad_norm_(self.model_Q.parameters(), self.grad_clip_value)
                 torch.nn.utils.clip_grad_norm_(self.model_psi.parameters(), self.grad_clip_value)
                 self.optimizer_Q.step()
                 self.optimizer_psi.step()
+                if profiler is not None:
+                    profiler['optim'] += time.perf_counter() - t_opt
 
-        # Aggregated metrics
+        def safe_mean(values):
+            if not values:
+                return float('nan')
+            arr = np.asarray(values, dtype=np.float64)
+            mask = np.isfinite(arr)
+            if not mask.any():
+                return float('nan')
+            return float(np.mean(arr[mask]))
+
         res = {
-            'euler': np.mean(losses_euler),
-            'L1': np.mean(losses_L1),
-            'L2': np.mean(losses_L2),
-            'L3': np.mean(losses_L3),
-            'symm': np.mean(losses_symm),
-            'Q_rmse': np.mean(rmse_Q),
-            'psi_rmse': np.mean(rmse_psi),
-            'psi_logcosh': np.mean(losses_psi),
-            'psi_mse': np.mean(losses_psi_mse),
-            'psi_r2': np.mean(psi_r2s),
+            'euler': safe_mean(euler_losses),
+            'L1': safe_mean(euler_L1),
+            'L2': safe_mean(euler_L2),
+            'L3': safe_mean(euler_L3),
+            'symm_loss': safe_mean(symm_losses),
+            'psi_rmse': safe_mean(psi_rmses),
+            'psi_r2': safe_mean(psi_r2s),
         }
+        if profiler is not None:
+            for key, value in profiler.items():
+                res[f'profile_{key}'] = value
+            res['profile_total'] = sum(profiler.values())
         return res
 
-    def _r2(self, pred, true):
-        pred, true = pred.flatten().detach().cpu().numpy(), true.flatten().detach().cpu().numpy()
-        ss_res = np.sum((true - pred)**2)
-        ss_tot = np.sum((true - np.mean(true))**2) + 1e-8
+    @staticmethod
+    def _r2(pred, true):
+        pred_np = pred.detach().cpu().numpy().reshape(-1)
+        true_np = true.detach().cpu().numpy().reshape(-1)
+        mask = np.isfinite(pred_np) & np.isfinite(true_np)
+        if not np.any(mask):
+            return float('nan')
+        pred_np = pred_np[mask]
+        true_np = true_np[mask]
+        mean_true = np.mean(true_np)
+        ss_res = np.sum((true_np - pred_np) ** 2)
+        ss_tot = np.sum((true_np - mean_true) ** 2) + 1e-8
         return 1 - ss_res / ss_tot
 
     def plot_history(self, save_dir=None):
@@ -617,17 +828,31 @@ class AIBMTrainer:
         axs[0, 1].grid(True, ls=':', alpha=0.6)
         axs[0, 1].legend()
 
-        # Panel 3: Q metrics
-        axs[1, 0].plot(epochs, df['Q_rmse'], 'C5-', lw=2, label='Q RMSE')
-        axs[1, 0].plot(epochs, ema(df['Q_rmse'], self.ema_alpha), 'C5--', lw=1.5, label='Q RMSE EMA')
-        if 'symm' in df.columns:
-            axs[1, 0].plot(epochs, df['symm'], 'C9-', lw=1.2, alpha=0.8, label='Symmetry loss')
+        # Panel 3: Q metrics (optional)
+        q_panel_plotted = False
+        if 'Q_rmse' in df.columns:
+            axs[1, 0].plot(epochs, df['Q_rmse'], 'C5-', lw=2, label='Q RMSE')
+            axs[1, 0].plot(epochs, ema(df['Q_rmse'], self.ema_alpha), 'C5--', lw=1.5, label='Q RMSE EMA')
+            q_panel_plotted = True
+        if 'tensor_mse' in df.columns:
+            axs[1, 0].plot(epochs, df['tensor_mse'], 'C9-', lw=1.2, alpha=0.8, label='Q MSE')
+            q_panel_plotted = True
+        if 'tensor_logcosh' in df.columns:
+            axs[1, 0].plot(epochs, df['tensor_logcosh'], 'C10-', lw=1.2, alpha=0.8, label='Q Log-Cosh')
+            q_panel_plotted = True
         if 'hess_rmse' in df.columns:
-            axs[1, 0].plot(epochs, df['hess_rmse'], 'C10-', lw=1.2, alpha=0.8, label='Max Hessian eig.')
-        axs[1, 0].set_ylabel('Q metrics')
-        axs[1, 0].set_xlabel('Epoch')
-        axs[1, 0].grid(True, ls=':', alpha=0.6)
-        axs[1, 0].legend()
+            axs[1, 0].plot(epochs, df['hess_rmse'], 'C11-', lw=1.2, alpha=0.8, label='Max Hessian eig.')
+            q_panel_plotted = True
+        if 'symm_loss' in df.columns:
+            axs[1, 0].plot(epochs, df['symm_loss'], 'C3-', lw=1.2, alpha=0.8, label='Symmetry loss')
+            q_panel_plotted = True
+        if q_panel_plotted:
+            axs[1, 0].set_ylabel('Q metrics')
+            axs[1, 0].set_xlabel('Epoch')
+            axs[1, 0].grid(True, ls=':', alpha=0.6)
+            axs[1, 0].legend()
+        else:
+            axs[1, 0].axis('off')
 
         # Panel 4: Learning rate curves (if available)
         if ('lr_Q' in df.columns) or ('lr_psi' in df.columns):
@@ -652,7 +877,6 @@ class AIBMTrainer:
         plt.close(fig)
 
     def save_snapshot(self, epoch, val_metrics, save_dir, tag=None):
-        """Save model/optimizer states with optional tag (e.g., 'best', 'last')"""
         os.makedirs(save_dir, exist_ok=True)
         state = {
             'epoch': epoch,
@@ -663,18 +887,75 @@ class AIBMTrainer:
             'val_metrics': val_metrics
         }
         fname = f"snapshot_epoch{epoch:03d}"
-        if tag: fname += f"_{tag}"
+        if tag:
+            fname += f"_{tag}"
         fname += ".pt"
         torch.save(state, os.path.join(save_dir, fname))
 
     def load_snapshot(self, snapshot_path, strict=True):
-        """Restore a previously saved snapshot"""
         state = torch.load(snapshot_path, map_location=self.device, weights_only=False)
         self.model_Q.load_state_dict(state['model_Q'], strict=strict)
         self.model_psi.load_state_dict(state['model_psi'], strict=strict)
         self.optimizer_Q.load_state_dict(state['optimizer_Q'])
         self.optimizer_psi.load_state_dict(state['optimizer_psi'])
         return state
+
+
+def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, epochs_per_trial=20):
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "Optuna is required for Bayesian optimisation but is not installed. "
+            "Install it with `pip install optuna`."
+        ) from exc
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def objective(trial: "optuna.trial.Trial") -> float:
+        lr_q = trial.suggest_float('learning_rate_Q', 1e-4, 1e-2, log=True)
+        lr_psi = trial.suggest_float('learning_rate_psi', 1e-4, 5e-2, log=True)
+        grad_clip = trial.suggest_float('grad_clip', 1.0, 15.0)
+        dropout = trial.suggest_float('dropout', 0.05, 0.35)
+        lr_sched = trial.suggest_categorical('lr_scheduler', ['linear', 'cosine', 'warmup_cosine', 'none'])
+        warmup = trial.suggest_int('warmup_epochs', 0, max(0, epochs_per_trial // 3))
+
+        drop_kind = getattr(base_args, 'dropout_type', 'dropout')
+        shake_alpha = getattr(base_args, 'shakeout_alpha', 0.0)
+        model_Q = TBNN_Q_direction(dropout_p=dropout, dropout_type=drop_kind, shakeout_alpha=shake_alpha).to(device, dtype=torch.float32)
+        model_psi = FCNN_psi_magnitude(dropout_p=dropout, dropout_type=drop_kind, shakeout_alpha=shake_alpha).to(device, dtype=torch.float32)
+
+        trainer = AIBMTrainer(
+            model_Q=model_Q,
+            model_psi=model_psi,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=epochs_per_trial,
+            learning_rate_Q=lr_q,
+            learning_rate_psi=lr_psi,
+            grad_clip_value=grad_clip,
+            symm_loss_weight=0.0,
+            print_every=max(1, epochs_per_trial // 5),
+            metrics_save_path=None,
+            ema_smoothing=base_args.ema_smoothing,
+            log_header_interval=max(1, base_args.log_header_interval),
+            dropout_p=dropout,
+            lr_scheduler_type=lr_sched,
+            warmup_epochs=warmup,
+            snapshot_dir=None,
+            log_interval_type=base_args.log_interval_type,
+            log_interval_seconds=base_args.log_interval_seconds,
+            enable_profiler=not getattr(base_args, 'disable_profiler', False),
+            compile_models=getattr(base_args, 'compile_models', False)
+        )
+
+        trainer.train(epochs=epochs_per_trial)
+        return trainer.best.get('euler', float('inf'))
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=trials, show_progress_bar=False)
+    return study.best_trial
+
 
 
 # ==============================================================================
@@ -763,7 +1044,7 @@ class AIBMVisualizer:
             Qp_true, Qhat_true, psi_true = process_ground_truth_Q(Q, eps)
 
             # Model predictions
-            Qhat_pred, _ = self.mQ(s_norm, w)
+            Qhat_pred = self.mQ(s_norm, w)
             psi_pred = self.mP(q, r)
 
         self.A, self.Q = A, Q
@@ -904,7 +1185,7 @@ class AIBMVisualizer:
         qv, rp, rm = self._vieillefosse(q.min(), q.max())
         ax.plot(rp, qv, 'w--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'w--', lw=1.1)
         ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title(r'DNS: $\psi(q,r)$'); ax.grid(True, ls=':', alpha=0.45)
-        ax.set_xlim(-0.3, 0.3); ax.set_ylim(-0.5, 0.5)
+        ax.set_xlim(-0.25, 0.25); ax.set_ylim(-0.5, 0.5)
         cb = fig.colorbar(hb, ax=ax, pad=0.01)
         cb.set_label(r'$\langle \psi \rangle$')
         hb.set_clim(0.0, 2.0)
@@ -917,7 +1198,7 @@ class AIBMVisualizer:
         qv, rp, rm = self._vieillefosse(q.min(), q.max())
         ax.plot(rp, qv, 'w--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'w--', lw=1.1)
         ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title(r'AIBM: $\psi(q,r)$'); ax.grid(True, ls=':', alpha=0.45)
-        ax.set_xlim(-0.3, 0.3); ax.set_ylim(-0.5, 0.5)
+        ax.set_xlim(-0.25, 0.25); ax.set_ylim(-0.5, 0.5)
         cb = fig.colorbar(hb, ax=ax, pad=0.01)
         cb.set_label(r'$\langle \psi \rangle$')
         hb.set_clim(0.0, 2.0)
@@ -933,28 +1214,28 @@ class AIBMVisualizer:
 
         # DNS
         fig, ax = plt.subplots(figsize=(6.6, 5.6))
-        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=0.0, vmax=2.0)
+        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
         qv, rp, rm = self._vieillefosse(q.min(), q.max())
         ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
         ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('DNS: joint PDF in $(q,r)$')
-        ax.set_xlim(-0.3, 0.3); ax.set_ylim(-0.5, 0.5)
+        ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
         ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
         cb = fig.colorbar(hb, ax=ax, pad=0.01)
         cb.set_label('PDF (a.u.)')
-        hb.set_clim(5.0, 40.0)
+        hb.set_clim(5.0, 35.0)
         fig.savefig(self.save_dir / '02A_qr_pdf_dns.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
 
         # AIBM (same (q,r) cloud; still shown separately)
         fig, ax = plt.subplots(figsize=(6.6, 5.6))
-        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=0.0, vmax=2.0)
+        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
         qv, rp, rm = self._vieillefosse(q.min(), q.max())
         ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
         ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('AIBM: joint PDF in $(q,r)$')
-        ax.set_xlim(-0.3, 0.3); ax.set_ylim(-0.5, 0.5)
+        ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
         ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
         cb = fig.colorbar(hb, ax=ax, pad=0.01)
         cb.set_label('PDF (a.u.)')
-        hb.set_clim(5.0, 40.0)
+        hb.set_clim(5.0, 35.0)
         fig.savefig(self.save_dir / '02B_qr_pdf_aibm.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
 
     # ------------------------------------------------------------------ #
@@ -976,17 +1257,34 @@ class AIBMVisualizer:
             s_r, w_r, eps_r, q_r, r_r = get_tensor_derivatives(A_rot)
             a_r = A_rot / eps_r.view(-1, 1, 1)
             s_norm_r = 0.5 * (a_r + a_r.transpose(1, 2))
-            Qhat_r, _ = self.mQ(s_norm_r, w_r)
+            Qhat_r = self.mQ(s_norm_r, w_r)
             psi_r = self.mP(q_r, r_r)
         Q_mod = self.Q_pred_np
         Q_mod_rot = Qhat_r.detach().cpu().numpy().astype(np.float64) * \
                     psi_r.detach().cpu().numpy()[:, None, None] * \
                     (eps_r.detach().cpu().numpy()[:, None, None] ** 2)
 
-        def ratios(Qa, Qb):
+        def ratios(Qa, Qb, tol: float = 1e-9):
             lam_a, _ = self._eig_asc(Qa)
             lam_b, _ = self._eig_asc(Qb)
-            return np.abs(lam_b / np.maximum(np.abs(lam_a), 1e-12))  # columns: [γ,β,α]
+            abs_a = np.abs(lam_a)
+            abs_b = np.abs(lam_b)
+            ratio = np.ones_like(abs_a)
+
+            stable = abs_a > tol
+            ratio[stable] = abs_b[stable] / abs_a[stable]
+
+            near_zero_both = (~stable) & (abs_b <= tol)
+            ratio[near_zero_both] = 1.0
+
+            remaining = (~stable) & (~near_zero_both)
+            if np.any(remaining):
+                warnings.warn(
+                    "Invariant ratio encountered |lambda| < tol for original tensor but not for rotated; "
+                    "treating ratio conservatively. Inspect inputs if this persists."
+                )
+                ratio[remaining] = abs_b[remaining] / tol
+            return ratio  # columns: [γ,β,α]
 
         F_dns = ratios(Q_dns, Q_dns_rot)
         F_mod = ratios(Q_mod, Q_mod_rot)
@@ -998,21 +1296,23 @@ class AIBMVisualizer:
         # DNS only
         fig, axs = plt.subplots(1, 3, figsize=(13.2, 4.1), constrained_layout=True)
         for k in range(3):
-            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS")
+            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS", clip=(0.0, 6.0))
             axs[k].set_title(titles[k]); axs[k].set_xlabel("Ratio"); axs[k].grid(True, ls=':', alpha=0.45)
             axs[k].set_yscale('linear')
-            axs[k].set_ylim(0.0, 1.0e6)
+            axs[k].set_xlim(0.0, 6.0)
+            axs[k].set_ylim(0.0, 7.0)
         axs[0].legend()
         fig.savefig(self.save_dir / '03A_rotation_invariance_dns.png', dpi=self.DPI); plt.close(fig)
 
         # DNS vs AIBM overlay
         fig, axs = plt.subplots(1, 3, figsize=(13.2, 4.1), constrained_layout=True)
         for k in range(3):
-            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS")
-            sns.kdeplot(F_mod[:, k], ax=axs[k], bw_adjust=0.9, color="C1", lw=1.8, label="AIBM")
+            sns.kdeplot(F_dns[:, k], ax=axs[k], bw_adjust=0.9, color="k", lw=1.8, label="DNS", clip=(0.0, 6.0))
+            sns.kdeplot(F_mod[:, k], ax=axs[k], bw_adjust=0.9, color="C1", lw=1.8, label="AIBM", clip=(0.0, 6.0))
             axs[k].set_title(titles[k]); axs[k].set_xlabel("Ratio"); axs[k].grid(True, ls=':', alpha=0.45)
             axs[k].set_yscale('linear')
-            axs[k].set_ylim(0.0, 1.0e6)
+            axs[k].set_xlim(0.0, 6.0)
+            axs[k].set_ylim(0.0, 35.0)
         axs[0].legend()
         fig.savefig(self.save_dir / '03B_rotation_invariance_overlay.png', dpi=self.DPI); plt.close(fig)
 
@@ -1337,28 +1637,36 @@ if __name__ == '__main__':
     parser.add_argument('--resume-best', type=str, default=None, help="Path to best model checkpoint to resume")
     parser.add_argument('--run-dir', type=str, default=None, help="Path to specific run directory (default: latest run)")
     parser.add_argument('--train', action='store_true', help="If set, run training (otherwise only analysis)")
-    parser.add_argument('--epochs', type=int, default=1000, help="Number of epochs to train for.")
-    parser.add_argument('--learning-rate-q', type=float, default=5e-3, dest='learning_rate_q', help="Learning rate for the Q-direction model.")
-    parser.add_argument('--learning-rate-psi', type=float, default=25e-3, dest='learning_rate_psi', help="Learning rate for the ψ-magnitude model.")
-    parser.add_argument('--grad-clip', type=float, default=5.0, dest='grad_clip', help="Gradient clipping value.")
-    parser.add_argument('--symm-loss-weight', type=float, default=0.5, dest='symm_loss_weight', help="Weight for symmetry loss term.")
+    parser.add_argument('--epochs', type=int, default=400, help="Number of epochs to train for.")
+    parser.add_argument('--learning-rate-q', type=float, default=1e-3, dest='learning_rate_q', help="Learning rate for the Q-direction model.")
+    parser.add_argument('--learning-rate-psi', type=float, default=5e-3, dest='learning_rate_psi', help="Learning rate for the ψ-magnitude model.")
+    parser.add_argument('--grad-clip', type=float, default=100.0, dest='grad_clip', help="Gradient clipping value.")
+    parser.add_argument('--symm-loss-weight', type=float, default=1.0, dest='symm_loss_weight', help="Weight for symmetry penalty encouraging P̂ to remain symmetric.")
     parser.add_argument('--ema-smoothing', type=float, default=0.15, dest='ema_smoothing', help="EMA smoothing factor for history plots.")
-    parser.add_argument('--log-header-interval', type=int, default=30, help="How often (in printed lines) to re-print the log header.")
-    parser.add_argument('--print-every', type=int, default=10, help="Print metrics every N epochs.")
-    parser.add_argument('--optimizer-beta1', type=float, default=0.95, dest='optimizer_beta1', help="AdamW β₁.")
-    parser.add_argument('--optimizer-beta2', type=float, default=0.9995, dest='optimizer_beta2', help="AdamW β₂.")
-    parser.add_argument('--optimizer-weight-decay', type=float, default=1e-2, dest='optimizer_weight_decay', help="AdamW weight decay.")
-    parser.add_argument('--optimizer-eps', type=float, default=1e-8, dest='optimizer_eps', help="AdamW epsilon.")
-    parser.add_argument('--dropout-schedule', type=str, default='constant',
-                        choices=['constant', 'annealing_cosine', 'linear'],
-                        help="Dropout scheduling strategy.")
-    parser.add_argument('--dropout-initial', type=float, default=0.1, dest='dropout_initial', help="Initial dropout probability.")
-    parser.add_argument('--dropout-final', type=float, default=0.1, dest='dropout_final', help="Final dropout probability.")
-    parser.add_argument('--dropout-warmup', type=int, default=0, dest='dropout_warmup', help="Warmup epochs before applying decay schedules.")
-    parser.add_argument('--dropout-min', type=float, default=0.0, dest='dropout_min', help="Minimum allowable dropout probability.")
-    parser.add_argument('--dropout-max', type=float, default=1.0, dest='dropout_max', help="Maximum allowable dropout probability.")
-    parser.add_argument('--bayes-opt-trials', type=int, default=0, dest='bayes_opt_trials', help="Number of Bayesian optimisation trials to run before training.")
-    parser.add_argument('--bayes-opt-epochs', type=int, default=50, dest='bayes_opt_epochs', help="Epochs per Bayesian optimisation trial.")
+    parser.add_argument('--log-header-interval', type=int, default=25, help="How often (in printed lines) to re-print the log header.")
+    parser.add_argument('--print-every', type=int, default=1, help="Print metrics every N epochs.")
+    parser.add_argument('--log-interval-type', type=str, default='epoch',
+                        help="Use 'epoch' to log every --print-every epochs or 'time' to log after --log-interval-seconds seconds.")
+    parser.add_argument('--log-interval-seconds', type=float, default=60.0,
+                        help="When --log-interval-type is 'time', minimum wall-clock seconds between console logs.")
+    parser.add_argument('--disable-profiler', action='store_true',
+                        help="Disable intra-epoch timing profiler aggregation.")
+    parser.add_argument('--compile-models', action='store_true',
+                        help="Enable torch.compile on the neural networks for potential fused kernels.")
+    parser.add_argument('--dropout', type=float, default=0.1, help="Dropout probability applied uniformly across the networks.")
+    parser.add_argument('--dropout-type', type=str, default='dropout', choices=['dropout', 'shakeout'],
+                        help="Use standard dropout or shakeout regularisation in the MLP blocks.")
+    parser.add_argument('--shakeout-alpha', type=float, default=0.0,
+                        help="Noise magnitude for shakeout; ignored when --dropout-type=dropout.")
+    parser.add_argument('--lr-scheduler', type=str, default='linear',
+                        choices=['none', 'linear', 'cosine', 'warmup_cosine'],
+                        help="Learning rate scheduler strategy.")
+    parser.add_argument('--warmup-epochs', type=int, default=10, dest='warmup_epochs',
+                        help="Warmup epochs for warmup_cosine scheduler.")
+    parser.add_argument('--bayes-opt-trials', type=int, default=0, dest='bayes_opt_trials',
+                        help="Number of Bayesian optimisation trials to run before training.")
+    parser.add_argument('--bayes-opt-epochs', type=int, default=50, dest='bayes_opt_epochs',
+                        help="Epochs per Bayesian optimisation trial.")
     args = parser.parse_args()
 
     # -------- Set up RUN_DIR --------
@@ -1382,60 +1690,50 @@ if __name__ == '__main__':
     except FileNotFoundError:
         print("Creating dummy .mat files for demonstration...")
         N = 100000
-        vel_grad_dummy = np.random.randn(9, N).astype(np.float64)
-        ph_dummy = np.random.randn(N, 9).astype(np.float64)
+        vel_grad_dummy = np.random.randn(9, N).astype(np.float32)
+        ph_dummy = np.random.randn(N, 9).astype(np.float32)
         scipy.io.savemat('velGrad.mat', {'velGrad': vel_grad_dummy}); scipy.io.savemat('PH.mat', {'PH': ph_dummy})
 
     full_dataset = MatlabDataset('velGrad.mat', 'PH.mat')
     train_size = int(0.8 * len(full_dataset)); val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4096, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16384, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=2)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=65536, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=4)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=65536, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=4)
 
     best_bayes_trial = None
     if args.bayes_opt_trials > 0:
         try:
             best_bayes_trial = run_bayesian_optimization(
-                train_loader,
-                val_loader,
+                train_loader=train_loader,
+                val_loader=val_loader,
                 base_args=args,
                 trials=args.bayes_opt_trials,
                 epochs_per_trial=args.bayes_opt_epochs
             )
-            best_params = best_bayes_trial.params
             print("\nBayesian optimisation best trial:")
-            for key, value in sorted(best_params.items()):
+            for key, value in sorted(best_bayes_trial.params.items()):
                 print(f"  {key}: {value}")
             print(f"  validation_euler: {best_bayes_trial.value}")
 
-            args.learning_rate_q = best_params.get('learning_rate_Q', args.learning_rate_q)
-            args.learning_rate_psi = best_params.get('learning_rate_psi', args.learning_rate_psi)
-            args.grad_clip = best_params.get('grad_clip', args.grad_clip)
-            args.symm_loss_weight = best_params.get('symm_weight', args.symm_loss_weight)
-            args.optimizer_beta1 = best_params.get('beta1', args.optimizer_beta1)
-            args.optimizer_beta2 = best_params.get('beta2', args.optimizer_beta2)
-            args.optimizer_weight_decay = best_params.get('weight_decay', args.optimizer_weight_decay)
-            args.dropout_schedule = best_params.get('dropout_schedule', args.dropout_schedule)
-            args.dropout_initial = best_params.get('dropout_initial', args.dropout_initial)
-            args.dropout_final = best_params.get('dropout_final', args.dropout_final)
-            args.dropout_warmup = best_params.get('dropout_warmup', args.dropout_warmup)
+            params = best_bayes_trial.params
+            args.learning_rate_q = params.get('learning_rate_Q', args.learning_rate_q)
+            args.learning_rate_psi = params.get('learning_rate_psi', args.learning_rate_psi)
+            args.grad_clip = params.get('grad_clip', args.grad_clip)
+            args.dropout = params.get('dropout', args.dropout)
+            args.lr_scheduler = params.get('lr_scheduler', args.lr_scheduler)
+            args.warmup_epochs = params.get('warmup_epochs', args.warmup_epochs)
         except RuntimeError as opt_err:
             print(f"Bayesian optimisation skipped: {opt_err}")
         except Exception as opt_generic:
-            print(f"Bayesian optimisation failed due to: {opt_generic}")
+            print(f"Bayesian optimisation failed: {opt_generic}")
 
-    dropout_config = {
-        'type': args.dropout_schedule,
-        'initial': args.dropout_initial,
-        'final': args.dropout_final,
-        'warmup_epochs': args.dropout_warmup,
-        'min': args.dropout_min,
-        'max': args.dropout_max
-    }
-
-    model_Q = TBNN_Q_direction(dropout_p=args.dropout_initial)
-    model_psi = FCNN_psi_magnitude(dropout_p=args.dropout_initial)
+    model_Q = TBNN_Q_direction(dropout_p=args.dropout,
+                               dropout_type=args.dropout_type,
+                               shakeout_alpha=args.shakeout_alpha)
+    model_psi = FCNN_psi_magnitude(dropout_p=args.dropout,
+                                   dropout_type=args.dropout_type,
+                                   shakeout_alpha=args.shakeout_alpha)
 
     metrics_path = str(RUN_DIR / 'metrics.csv') if args.train else None
     trainer = AIBMTrainer(
@@ -1452,11 +1750,14 @@ if __name__ == '__main__':
         metrics_save_path=metrics_path,
         ema_smoothing=args.ema_smoothing,
         log_header_interval=args.log_header_interval,
-        optimizer_betas=(args.optimizer_beta1, args.optimizer_beta2),
-        optimizer_weight_decay=args.optimizer_weight_decay,
-        optimizer_eps=args.optimizer_eps,
-        dropout_schedule_config=dropout_config,
-        snapshot_dir=str(RUN_DIR)
+        dropout_p=args.dropout,
+        lr_scheduler_type=args.lr_scheduler,
+        warmup_epochs=args.warmup_epochs,
+        snapshot_dir=str(RUN_DIR),
+        log_interval_type=args.log_interval_type,
+        log_interval_seconds=args.log_interval_seconds,
+        enable_profiler=not args.disable_profiler,
+        compile_models=args.compile_models
     )
 
     # -------- Auto-restore logic --------
@@ -1494,78 +1795,3 @@ if __name__ == '__main__':
         visualizer.plot_all()
     except Exception as e:
         print(f"Could not generate visualizations due to an error: {e}")
-
-
-def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, epochs_per_trial=20):
-    """
-    Launch Bayesian optimisation over a broad hyperparameter space.
-    Returns the best Optuna trial (or raises if Optuna is unavailable).
-    """
-    try:
-        import optuna
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "Bayesian optimisation requested, but Optuna is not installed. "
-            "Install it via `pip install optuna` and retry."
-        ) from exc
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    def objective(trial: "optuna.trial.Trial") -> float:
-        seed_offset = trial.number
-        torch.manual_seed(42 + seed_offset)
-        np.random.seed(42 + seed_offset)
-
-        lr_q = trial.suggest_float('learning_rate_Q', 1e-4, 1e-2, log=True)
-        lr_psi = trial.suggest_float('learning_rate_psi', 1e-4, 5e-2, log=True)
-        grad_clip = trial.suggest_float('grad_clip', 1.0, 20.0)
-        symm_weight = trial.suggest_float('symm_weight', 0.1, 2.0)
-        beta1 = trial.suggest_float('beta1', 0.85, 0.99)
-        beta2 = trial.suggest_float('beta2', 0.95, 0.9999)
-        weight_decay = trial.suggest_float('weight_decay', 1e-5, 1e-1, log=True)
-        dropout_initial = trial.suggest_float('dropout_initial', 0.05, 0.35)
-        dropout_final = trial.suggest_float('dropout_final', 0.01, 0.35)
-        dropout_schedule = trial.suggest_categorical('dropout_schedule', ['constant', 'annealing_cosine', 'linear'])
-        dropout_warmup = trial.suggest_int('dropout_warmup', 0, max(0, epochs_per_trial // 2))
-
-        dropout_cfg = {
-            'type': dropout_schedule,
-            'initial': dropout_initial,
-            'final': dropout_final,
-            'warmup_epochs': dropout_warmup
-        }
-
-        model_Q = TBNN_Q_direction(dropout_p=dropout_initial).to(device, dtype=torch.float64)
-        model_psi = FCNN_psi_magnitude(dropout_p=dropout_initial).to(device, dtype=torch.float64)
-
-        trainer = AIBMTrainer(
-            model_Q, model_psi,
-            train_loader, val_loader,
-            epochs=epochs_per_trial,
-            learning_rate_Q=lr_q,
-            learning_rate_psi=lr_psi,
-            grad_clip_value=grad_clip,
-            symm_loss_weight=symm_weight,
-            print_every=max(1, epochs_per_trial // 5),
-            metrics_save_path=None,
-            ema_smoothing=base_args.ema_smoothing,
-            log_header_interval=max(1, base_args.log_header_interval),
-            optimizer_betas=(beta1, beta2),
-            optimizer_weight_decay=weight_decay,
-            optimizer_eps=base_args.optimizer_eps,
-            dropout_schedule_config=dropout_cfg,
-            snapshot_dir=None
-        )
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            trainer.train(epochs=epochs_per_trial)
-
-        best_metric = trainer.best.get('euler', float('inf'))
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return best_metric
-
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=trials, show_progress_bar=False)
-    return study.best_trial

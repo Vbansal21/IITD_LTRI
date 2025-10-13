@@ -1,0 +1,26 @@
+2024-05-30 Mixed-precision + configuration alignment overhaul
+---------------------------------------------------------
+Scope: PANN_PressureHessianTensor/train.py
+
+1. Mixed precision training (float32 base with autocast to float16 on CUDA)
+   - Lines 334-347: Trainer now records `train_dtype=float32` and enables AMP when CUDA is present, instantiating a GradScaler.
+   - Lines 362-369 & 422-487: Forward passes execute under autocast, with data converted from fp64 to fp32 for training while retaining original fp64 tensors elsewhere. 
+   - Lines 474-487: Backprop uses scaled gradients on CUDA and gracefully falls back to standard fp32 ops on CPU, enforcing gradient clipping before optimizer steps.
+
+2. Optimizer reverted to Adamax as per paper baseline
+   - Lines 338-344: Both sub-networks now use Adamax with cosine annealing schedulers (`eta_min=0.0`).
+
+3. Dropout scheduling removed; constant dropout maintained
+   - Lines 334-369: Scheduler support stripped out; `_set_model_dropout` (lines 505-510) applies a fixed user-configurable dropout probability to every Dropout layer once at init.
+
+4. Logging & metrics cleanup to reflect new setup
+   - Lines 351-417: Training loop records lr/time only, no longer tracks dynamic dropout values.
+   - Lines 436-468: Metric aggregation averages Euler components across raw/processed predictions and stores scalar floats to avoid dtype drift.
+
+5. CLI simplification & feature parity with paper
+   - Lines 1278-1286: Command-line interface trimmed to core hyperparameters plus a constant dropout knob.
+   - Lines 1323-1352: Trainer instantiation updated to pass the simplified config; Bayesian optimisation hooks and dropout schedule plumbing removed entirely.
+
+6. Housekeeping
+   - Removed unused helper classes/functions (dropout scheduler, Optuna search) and stale optimizer arguments.
+   - Confirmed plots and dataset handling remain fp64 by keeping MatlabDataset outputs untouched and only casting per-batch copies during training.
