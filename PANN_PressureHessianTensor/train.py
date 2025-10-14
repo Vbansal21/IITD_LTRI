@@ -15,6 +15,7 @@ import argparse
 import glob
 import collections
 from pathlib import Path
+from typing import Optional
 
 # --- Put once at top of your module (before plt imports) ---
 import matplotlib
@@ -33,9 +34,7 @@ warnings.filterwarnings('ignore')
 torch.manual_seed(42)
 np.random.seed(42)
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision("medium")
-# torch.backends.opt_einsum.enabled = False
-# torch.backends.opt_einsum.strategy = 'auto'
+torch.set_float32_matmul_precision("high")
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -124,13 +123,17 @@ class Shakeout(nn.Module):
         if not self.training or self.p == 0.0:
             return input
         device = input.device
-        keep_mask = torch.empty_like(input, device=device).bernoulli_(1.0 - self.p)
+        keep_prob = 1.0 - self.p
+        keep_mask = torch.empty_like(input, device=device).bernoulli_(keep_prob)
         drop_mask = 1.0 - keep_mask
         if self.alpha == 0.0:
             noise = torch.zeros_like(input, device=device)
         else:
             noise = torch.empty_like(input, device=device).bernoulli_(0.5).mul_(2.0).sub_(1.0) * self.alpha
-        return input * keep_mask + noise * drop_mask
+        out = keep_mask * input + drop_mask * noise
+        if keep_prob > 0.0:
+            out = out / keep_prob
+        return out
 
 def ema(arr, alpha=0.15):
     arr = np.asarray(arr, dtype=np.float64)
@@ -277,7 +280,7 @@ class TBNN_Q_direction(nn.Module):
         self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.9))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.5))
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 10)
         self.activation = nn.LeakyReLU(0.1)
@@ -299,7 +302,7 @@ class TBNN_Q_direction(nn.Module):
             x = self.activation(x)
             x = bn(x)
             x = self.dropout(x)
-        g = self.output_layer(x)
+        g = F.relu(self.output_layer(x))
         Q_hat_raw = torch.einsum('bn,bnij->bij', g, tensor_bases)
 
         sym_penalty = None
@@ -333,7 +336,7 @@ class FCNN_psi_magnitude(nn.Module):
         self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.9))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.5))
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 1)
         self.activation = nn.LeakyReLU(0.1)
@@ -354,7 +357,7 @@ class FCNN_psi_magnitude(nn.Module):
             x = self.activation(x)
             x = bn(x)
             x = self.dropout(x)
-        return self.output_layer(x).squeeze()
+        return F.relu(self.output_layer(x)).squeeze()
 
     def _init_weights(self):
         for linear in self.linears:
@@ -364,6 +367,107 @@ class FCNN_psi_magnitude(nn.Module):
         nn.init.zeros_(self.output_layer.bias)
 
 # ==============================================================================
+# 4. CUSTOM LEARNING-RATE SCHEDULER
+# ==============================================================================
+
+
+class ChainedCosineExpLR(torch.optim.lr_scheduler._LRScheduler):
+    """Warmup → optional cosine anneal → exponential decay scheduler."""
+
+    def __init__(
+        self,
+        optimizer,
+        max_lr,
+        total_steps: int,
+        pct_start: float,
+        div_factor: float = 25.0,
+        final_div_factor: float = 10000.0,
+        three_phase: bool = False,
+        anneal_strategy: str = 'cos',
+        last_epoch: int = -1
+    ):
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive.")
+        pct_start = float(np.clip(pct_start, 1e-6, 0.999))
+        self.total_steps = int(total_steps)
+        self.three_phase = bool(three_phase)
+        strategy = (anneal_strategy or 'cos').strip().lower()
+        if strategy not in {'cos', 'linear'}:
+            raise ValueError("anneal_strategy must be 'cos' or 'linear'.")
+        self.anneal_strategy = strategy
+
+        if isinstance(max_lr, (list, tuple)):
+            if len(max_lr) != len(optimizer.param_groups):
+                raise ValueError("max_lr length mismatch with optimizer param groups.")
+            self.max_lrs = [float(lr) for lr in max_lr]
+        else:
+            self.max_lrs = [float(max_lr)] * len(optimizer.param_groups)
+
+        self.div_factor = float(div_factor)
+        self.final_div_factor = float(final_div_factor)
+        self.base_lrs = [lr / self.div_factor for lr in self.max_lrs]
+        self.min_lrs = [lr / self.final_div_factor for lr in self.max_lrs]
+
+        warmup_steps = max(1, int(round(self.total_steps * pct_start)))
+        if warmup_steps >= self.total_steps:
+            warmup_steps = max(1, self.total_steps - 1)
+        self.warmup_steps = warmup_steps
+        if self.three_phase:
+            remaining = max(1, self.total_steps - self.warmup_steps)
+            self.anneal_steps = max(1, remaining // 2)
+        else:
+            self.anneal_steps = 0
+        self.decay_steps = max(1, self.total_steps - self.warmup_steps - self.anneal_steps)
+        self.decay_start_lrs = self.base_lrs if self.three_phase else self.max_lrs
+
+        for group, base_lr in zip(optimizer.param_groups, self.base_lrs):
+            group['lr'] = base_lr
+            group.setdefault('initial_lr', base_lr)
+
+        super().__init__(optimizer, last_epoch)
+
+    def _phase_progress(self, step: int) -> tuple[str, float]:
+        if step < self.warmup_steps:
+            return 'warmup', (step + 1) / self.warmup_steps
+        if self.three_phase:
+            boundary = self.warmup_steps + self.anneal_steps
+            if step < boundary:
+                return 'anneal', (step - self.warmup_steps + 1) / self.anneal_steps
+        decay_start = self.warmup_steps + self.anneal_steps
+        return 'decay', (step - decay_start + 1) / self.decay_steps
+
+    def _shape_factor(self, progress: float, invert: bool = False) -> float:
+        progress = float(np.clip(progress, 0.0, 1.0))
+        if self.anneal_strategy == 'cos':
+            value = 0.5 * (1.0 - math.cos(math.pi * progress))
+        else:
+            value = progress
+        return 1.0 - value if invert else value
+
+    def get_lr(self):
+        step = self.last_epoch
+        if step < 0:
+            return self.base_lrs
+
+        phase, progress = self._phase_progress(step)
+        progress = float(np.clip(progress, 0.0, 1.0))
+        lrs = []
+        for idx, (base_lr, max_lr, min_lr) in enumerate(zip(self.base_lrs, self.max_lrs, self.min_lrs)):
+            if phase == 'warmup':
+                factor = self._shape_factor(progress)
+                lr = base_lr + factor * (max_lr - base_lr)
+            elif phase == 'anneal':
+                factor = self._shape_factor(progress, invert=True)
+                lr = base_lr + factor * (max_lr - base_lr)
+            else:
+                start_lr = self.decay_start_lrs[idx]
+                denom = max(start_lr, 1e-12)
+                decay_ratio = max(min_lr / denom, 1e-12)
+                lr = start_lr * (decay_ratio ** progress)
+                lr = max(lr, min_lr)
+            lrs.append(lr)
+        return lrs
+
 # 4. LOSS FUNCTIONS (With Physics Constraints and Log-Cosh)
 # ==============================================================================
 def euler_angle_loss(Q_hat_prime_pred, Q_hat_prime_true, s_true, precomputed=None):
@@ -420,10 +524,20 @@ class AIBMTrainer:
                 grad_clip_value=5.0, symm_loss_weight=0.5,
                 print_every=1, metrics_save_path=None,
                 ema_smoothing=0.15, log_header_interval=100,
-                dropout_p=0.1, lr_scheduler_type='linear', warmup_epochs=10,
+                dropout_p=0.1, lr_scheduler_type='linear', scheduler_warmup: float | None = 0.1,
                 snapshot_dir=None, log_interval_type='epoch',
                 log_interval_seconds=60.0, enable_profiler=True,
-                compile_models=False):
+                compile_models=False,
+                optimizer_name_q: str = 'adamax', optimizer_name_psi: str = 'adamax',
+                weight_decay_q: float = 0.0, weight_decay_psi: float = 0.0,
+                beta1_q: float = 0.9, beta2_q: float = 0.999,
+                beta1_psi: float = 0.9, beta2_psi: float = 0.999,
+                nadam_momentum_decay_q: float = 0.004,
+                nadam_momentum_decay_psi: float = 0.004,
+                chained_div_factor: float = 25.0,
+                chained_final_div_factor: float = 10000.0,
+                chained_three_phase: bool = False,
+                chained_anneal_strategy: str = 'cos'):
         self.epochs = epochs
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.train_dtype = torch.float64
@@ -439,12 +553,46 @@ class AIBMTrainer:
                 warnings.warn(f"torch.compile failed ({compile_err}); continuing without compilation.", stacklevel=2)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer_Q = torch.optim.Adamax(self.model_Q.parameters(), lr=learning_rate_Q)
-        self.optimizer_psi = torch.optim.Adamax(self.model_psi.parameters(), lr=learning_rate_psi)
+        self.optimizer_name_Q = (optimizer_name_q or 'adamax').strip().lower()
+        self.optimizer_name_psi = (optimizer_name_psi or 'adamax').strip().lower()
+        if self.optimizer_name_Q not in {'adamax', 'nadam'}:
+            raise ValueError("optimizer_name_q must be 'adamax' or 'nadam'.")
+        if self.optimizer_name_psi not in {'adamax', 'nadam'}:
+            raise ValueError("optimizer_name_psi must be 'adamax' or 'nadam'.")
+        self.weight_decay_Q = float(weight_decay_q)
+        self.weight_decay_psi = float(weight_decay_psi)
+        self.betas_Q = (float(beta1_q), float(beta2_q))
+        self.betas_psi = (float(beta1_psi), float(beta2_psi))
+        self.nadam_decay_Q = float(nadam_momentum_decay_q)
+        self.nadam_decay_psi = float(nadam_momentum_decay_psi)
+        self.optimizer_Q = self._create_optimizer(
+            self.optimizer_name_Q,
+            self.model_Q.parameters(),
+            learning_rate_Q,
+            self.weight_decay_Q,
+            self.betas_Q,
+            self.nadam_decay_Q
+        )
+        self.optimizer_psi = self._create_optimizer(
+            self.optimizer_name_psi,
+            self.model_psi.parameters(),
+            learning_rate_psi,
+            self.weight_decay_psi,
+            self.betas_psi,
+            self.nadam_decay_psi
+        )
         self.scheduler_type = lr_scheduler_type.strip().lower().replace(' ', '_')
         if self.scheduler_type in {'warmup_cosine_decay', 'warmup-cosine-decay'}:
             self.scheduler_type = 'warmup_cosine'
-        self.warmup_epochs = int(max(0, warmup_epochs))
+        self.scheduler_warmup_value = scheduler_warmup
+        self._warmup_config = self._resolve_warmup_config(scheduler_warmup)
+        self.chained_three_phase = bool(chained_three_phase)
+        self.chained_div_factor = float(chained_div_factor)
+        self.chained_final_div_factor = float(chained_final_div_factor)
+        strategy = (chained_anneal_strategy or 'cos').strip().lower()
+        if strategy not in {'cos', 'linear'}:
+            raise ValueError("chained_anneal_strategy must be 'cos' or 'linear'.")
+        self.chained_anneal_strategy = strategy
         self.scheduler_Q = self._build_scheduler(self.optimizer_Q)
         self.scheduler_psi = self._build_scheduler(self.optimizer_psi)
         self.grad_clip_value = grad_clip_value
@@ -620,6 +768,42 @@ class AIBMTrainer:
                 module.p = p
         self.dropout_p = p
 
+    def _resolve_warmup_config(self, warmup_value):
+        if warmup_value is None:
+            return {'input': None, 'pct': 0.0, 'epochs': 0}
+        try:
+            value = float(warmup_value)
+        except (TypeError, ValueError):
+            return {'input': warmup_value, 'pct': 0.0, 'epochs': 0}
+        if value <= 0.0:
+            return {'input': value, 'pct': 0.0, 'epochs': 0}
+        if value <= 1.0:
+            pct = float(np.clip(value, 1e-6, 0.999))
+            epochs = max(1, int(round(self.epochs * pct)))
+        else:
+            epochs = int(round(value))
+            epochs = int(np.clip(epochs, 1, max(1, self.epochs)))
+            pct = epochs / max(1, self.epochs)
+        return {'input': value, 'pct': pct, 'epochs': epochs}
+
+    @staticmethod
+    def _create_optimizer(name: str, params, lr: float, weight_decay: float,
+                          betas: tuple[float, float], nadam_decay: float):
+        name = (name or 'adamax').strip().lower()
+        if name == 'adamax':
+            return torch.optim.Adamax(params, lr=lr, betas=betas, eps=1e-8, weight_decay=weight_decay)
+        if name == 'nadam':
+            return torch.optim.NAdam(
+                params,
+                lr=lr,
+                betas=betas,
+                eps=1e-8,
+                weight_decay=weight_decay,
+                momentum_decay=nadam_decay,
+                decoupled_weight_decay=True
+            )
+        raise ValueError("Unsupported optimizer. Choose 'adamax' or 'nadam'.")
+
     def _build_scheduler(self, optimizer):
         sched = self.scheduler_type
         if sched == 'none':
@@ -633,7 +817,7 @@ class AIBMTrainer:
         if sched == 'cosine':
             return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=0.0)
         if sched in {'warmup_cosine', 'warmup-cosine', 'warmup_cosine_decay', 'warmupcosine'}:
-            warmup = min(self.warmup_epochs, max(0, self.epochs - 1))
+            warmup = min(self._warmup_config['epochs'], max(0, self.epochs - 1))
             def lr_lambda(epoch):
                 if warmup > 0 and epoch < warmup:
                     return float(epoch + 1) / float(warmup)
@@ -643,7 +827,20 @@ class AIBMTrainer:
                 progress = min(max(progress, 0.0), 1.0)
                 return 0.5 * (1.0 + math.cos(math.pi * progress))
             return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-        raise ValueError(f"Unknown scheduler type '{self.scheduler_type}'. Choose from 'none', 'linear', 'cosine', 'warmup_cosine'.")
+        if sched in {'chained', 'chained_cosine', 'chained_cosine_exp'}:
+            max_lr = [group['lr'] for group in optimizer.param_groups]
+            total_steps = max(1, self.epochs)
+            return ChainedCosineExpLR(
+                optimizer,
+                max_lr=max_lr if len(max_lr) > 1 else max_lr[0],
+                total_steps=total_steps,
+                pct_start=self._warmup_config['pct'],
+                div_factor=self.chained_div_factor,
+                final_div_factor=self.chained_final_div_factor,
+                three_phase=self.chained_three_phase,
+                anneal_strategy=self.chained_anneal_strategy
+            )
+        raise ValueError(f"Unknown scheduler type '{self.scheduler_type}'. Choose from 'none', 'linear', 'cosine', 'warmup_cosine', 'chained'.")
 
     def _prepare_raw_batch(self, batch):
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
@@ -918,7 +1115,7 @@ def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, ep
         grad_clip = trial.suggest_float('grad_clip', 1.0, 15.0)
         dropout = trial.suggest_float('dropout', 0.05, 0.35)
         lr_sched = trial.suggest_categorical('lr_scheduler', ['linear', 'cosine', 'warmup_cosine', 'none'])
-        warmup = trial.suggest_int('warmup_epochs', 0, max(0, epochs_per_trial // 3))
+        warmup = trial.suggest_float('scheduler_warmup', 0.0, 0.5)
 
         drop_kind = getattr(base_args, 'dropout_type', 'dropout')
         shake_alpha = getattr(base_args, 'shakeout_alpha', 0.0)
@@ -941,12 +1138,26 @@ def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, ep
             log_header_interval=max(1, base_args.log_header_interval),
             dropout_p=dropout,
             lr_scheduler_type=lr_sched,
-            warmup_epochs=warmup,
+            scheduler_warmup=warmup,
             snapshot_dir=None,
             log_interval_type=base_args.log_interval_type,
             log_interval_seconds=base_args.log_interval_seconds,
             enable_profiler=not getattr(base_args, 'disable_profiler', False),
-            compile_models=getattr(base_args, 'compile_models', False)
+            compile_models=getattr(base_args, 'compile_models', False),
+            optimizer_name_q=getattr(base_args, 'optimizer_q', 'adamax'),
+            optimizer_name_psi=getattr(base_args, 'optimizer_psi', 'adamax'),
+            weight_decay_q=getattr(base_args, 'weight_decay_q', 0.0),
+            weight_decay_psi=getattr(base_args, 'weight_decay_psi', 0.0),
+            beta1_q=getattr(base_args, 'beta1_q', 0.9),
+            beta2_q=getattr(base_args, 'beta2_q', 0.999),
+            beta1_psi=getattr(base_args, 'beta1_psi', 0.9),
+            beta2_psi=getattr(base_args, 'beta2_psi', 0.999),
+            nadam_momentum_decay_q=getattr(base_args, 'nadam_momentum_decay_q', 0.004),
+            nadam_momentum_decay_psi=getattr(base_args, 'nadam_momentum_decay_psi', 0.004),
+            chained_div_factor=getattr(base_args, 'chained_div_factor', 25.0),
+            chained_final_div_factor=getattr(base_args, 'chained_final_div_factor', 10000.0),
+            chained_three_phase=getattr(base_args, 'chained_three_phase', False),
+            chained_anneal_strategy=getattr(base_args, 'chained_anneal_strategy', 'cos')
         )
 
         trainer.train(epochs=epochs_per_trial)
@@ -1658,11 +1869,39 @@ if __name__ == '__main__':
                         help="Use standard dropout or shakeout regularisation in the MLP blocks.")
     parser.add_argument('--shakeout-alpha', type=float, default=0.0,
                         help="Noise magnitude for shakeout; ignored when --dropout-type=dropout.")
+    parser.add_argument('--optimizer-q', type=str, default='adamax', choices=['adamax', 'nadam'],
+                        help="Optimizer for the Q-direction network (adamax or nadam).")
+    parser.add_argument('--optimizer-psi', type=str, default='adamax', choices=['adamax', 'nadam'],
+                        help="Optimizer for the ψ-magnitude network (adamax or nadam).")
+    parser.add_argument('--weight-decay-q', type=float, default=0.01,
+                        help="Weight decay coefficient for the Q-direction optimizer.")
+    parser.add_argument('--weight-decay-psi', type=float, default=0.01,
+                        help="Weight decay coefficient for the ψ optimizer.")
+    parser.add_argument('--beta1-q', type=float, default=0.9,
+                        help="β₁ for the Q-direction optimizer.")
+    parser.add_argument('--beta2-q', type=float, default=0.999,
+                        help="β₂ for the Q-direction optimizer.")
+    parser.add_argument('--beta1-psi', type=float, default=0.9,
+                        help="β₁ for the ψ optimizer.")
+    parser.add_argument('--beta2-psi', type=float, default=0.999,
+                        help="β₂ for the ψ optimizer.")
+    parser.add_argument('--nadam-momentum-decay-q', type=float, default=0.004,
+                        help="Momentum decay for NAdam when used on the Q-direction model.")
+    parser.add_argument('--nadam-momentum-decay-psi', type=float, default=0.004,
+                        help="Momentum decay for NAdam when used on the ψ model.")
+    parser.add_argument('--chained-div-factor', type=float, default=25.0,
+                        help="Divisor applied to max_lr to obtain the chained scheduler base LR.")
+    parser.add_argument('--chained-final-div-factor', type=float, default=10000.0,
+                        help="Divisor applied to max_lr to obtain the chained scheduler minimum LR during decay.")
+    parser.add_argument('--chained-three-phase', action='store_true',
+                        help="Include a cosine annealing phase between warmup and exponential decay in the chained scheduler.")
+    parser.add_argument('--chained-anneal-strategy', type=str, default='cos', choices=['cos', 'linear'],
+                        help="Interpolation strategy for chained warmup/anneal segments.")
     parser.add_argument('--lr-scheduler', type=str, default='linear',
-                        choices=['none', 'linear', 'cosine', 'warmup_cosine'],
+                        choices=['none', 'linear', 'cosine', 'warmup_cosine', 'chained'],
                         help="Learning rate scheduler strategy.")
-    parser.add_argument('--warmup-epochs', type=int, default=10, dest='warmup_epochs',
-                        help="Warmup epochs for warmup_cosine scheduler.")
+    parser.add_argument('--scheduler-warmup', type=float, default=0.3,
+                        help="Warmup duration shared across schedulers (fraction in (0,1] or absolute epochs ≥1).")
     parser.add_argument('--bayes-opt-trials', type=int, default=0, dest='bayes_opt_trials',
                         help="Number of Bayesian optimisation trials to run before training.")
     parser.add_argument('--bayes-opt-epochs', type=int, default=50, dest='bayes_opt_epochs',
@@ -1722,7 +1961,7 @@ if __name__ == '__main__':
             args.grad_clip = params.get('grad_clip', args.grad_clip)
             args.dropout = params.get('dropout', args.dropout)
             args.lr_scheduler = params.get('lr_scheduler', args.lr_scheduler)
-            args.warmup_epochs = params.get('warmup_epochs', args.warmup_epochs)
+            args.scheduler_warmup = params.get('scheduler_warmup', args.scheduler_warmup)
         except RuntimeError as opt_err:
             print(f"Bayesian optimisation skipped: {opt_err}")
         except Exception as opt_generic:
@@ -1752,12 +1991,26 @@ if __name__ == '__main__':
         log_header_interval=args.log_header_interval,
         dropout_p=args.dropout,
         lr_scheduler_type=args.lr_scheduler,
-        warmup_epochs=args.warmup_epochs,
+        scheduler_warmup=args.scheduler_warmup,
         snapshot_dir=str(RUN_DIR),
         log_interval_type=args.log_interval_type,
         log_interval_seconds=args.log_interval_seconds,
         enable_profiler=not args.disable_profiler,
-        compile_models=args.compile_models
+        compile_models=args.compile_models,
+        optimizer_name_q=args.optimizer_q,
+        optimizer_name_psi=args.optimizer_psi,
+        weight_decay_q=args.weight_decay_q,
+        weight_decay_psi=args.weight_decay_psi,
+        beta1_q=args.beta1_q,
+        beta2_q=args.beta2_q,
+        beta1_psi=args.beta1_psi,
+        beta2_psi=args.beta2_psi,
+        nadam_momentum_decay_q=args.nadam_momentum_decay_q,
+        nadam_momentum_decay_psi=args.nadam_momentum_decay_psi,
+        chained_div_factor=args.chained_div_factor,
+        chained_final_div_factor=args.chained_final_div_factor,
+        chained_three_phase=args.chained_three_phase,
+        chained_anneal_strategy=args.chained_anneal_strategy
     )
 
     # -------- Auto-restore logic --------
