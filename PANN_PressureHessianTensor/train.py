@@ -16,6 +16,7 @@ import glob
 import collections
 from pathlib import Path
 from typing import Optional
+import matplotlib as mpl
 
 # --- Put once at top of your module (before plt imports) ---
 import matplotlib
@@ -31,10 +32,10 @@ plt.rcParams.update({
 
 # --- Configuration ---
 warnings.filterwarnings('ignore')
-torch.manual_seed(42)
-np.random.seed(42)
+# torch.manual_seed(42)
+# np.random.seed(42)
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("highest")
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -280,7 +281,7 @@ class TBNN_Q_direction(nn.Module):
         self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.5))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.05))
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 10)
         self.activation = nn.LeakyReLU(0.1)
@@ -302,7 +303,7 @@ class TBNN_Q_direction(nn.Module):
             x = self.activation(x)
             x = bn(x)
             x = self.dropout(x)
-        g = F.relu(self.output_layer(x))
+        g = self.output_layer(x)
         Q_hat_raw = torch.einsum('bn,bnij->bij', g, tensor_bases)
 
         sym_penalty = None
@@ -336,7 +337,7 @@ class FCNN_psi_magnitude(nn.Module):
         self.bns = nn.ModuleList()
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.5))
+            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.05))
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 1)
         self.activation = nn.LeakyReLU(0.1)
@@ -357,7 +358,7 @@ class FCNN_psi_magnitude(nn.Module):
             x = self.activation(x)
             x = bn(x)
             x = self.dropout(x)
-        return F.relu(self.output_layer(x)).squeeze()
+        return self.output_layer(x).squeeze()
 
     def _init_weights(self):
         for linear in self.linears:
@@ -1089,10 +1090,29 @@ class AIBMTrainer:
         fname += ".pt"
         torch.save(state, os.path.join(save_dir, fname))
 
+    @staticmethod
+    def _normalise_state_dict(state_dict):
+        if not isinstance(state_dict, (dict, collections.OrderedDict)):
+            return state_dict
+        prefixes = ("_orig_mod.", "module.")
+        needs_fix = any(any(key.startswith(prefix) for prefix in prefixes) for key in state_dict.keys())
+        if not needs_fix:
+            return state_dict
+        cleaned = collections.OrderedDict()
+        for key, value in state_dict.items():
+            new_key = key
+            for prefix in prefixes:
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix):]
+            cleaned[new_key] = value
+        return cleaned
+
     def load_snapshot(self, snapshot_path, strict=True):
         state = torch.load(snapshot_path, map_location=self.device, weights_only=False)
-        self.model_Q.load_state_dict(state['model_Q'], strict=strict)
-        self.model_psi.load_state_dict(state['model_psi'], strict=strict)
+        model_q_state = self._normalise_state_dict(state.get('model_Q', {}))
+        model_psi_state = self._normalise_state_dict(state.get('model_psi', {}))
+        self.model_Q.load_state_dict(model_q_state, strict=strict)
+        self.model_psi.load_state_dict(model_psi_state, strict=strict)
         self.optimizer_Q.load_state_dict(state['optimizer_Q'])
         self.optimizer_psi.load_state_dict(state['optimizer_psi'])
         return state
@@ -1419,35 +1439,112 @@ class AIBMVisualizer:
     # ------------------------------------------------------------------ #
     # 2) Joint PDF of (q,r) — separate DNS and AIBM, with colorbars
     # ------------------------------------------------------------------ #
+    # def fig_02_qr_pdf(self):
+    #     self._prepare()
+    #     q, r = self.q_np, self.r_np
+
+    #     # DNS
+    #     fig, ax = plt.subplots(figsize=(6.6, 5.6))
+    #     hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
+    #     qv, rp, rm = self._vieillefosse(q.min(), q.max())
+    #     ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
+    #     ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('DNS: joint PDF in $(q,r)$')
+    #     ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
+    #     ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
+    #     cb = fig.colorbar(hb, ax=ax, pad=0.01)
+    #     cb.set_label('PDF (a.u.)')
+    #     hb.set_clim(5.0, 35.0)
+    #     fig.savefig(self.save_dir / '02A_qr_pdf_dns.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
+    #     # AIBM (same (q,r) cloud; still shown separately)
+    #     fig, ax = plt.subplots(figsize=(6.6, 5.6))
+    #     hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
+    #     qv, rp, rm = self._vieillefosse(q.min(), q.max())
+    #     ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
+    #     ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('AIBM: joint PDF in $(q,r)$')
+    #     ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
+    #     ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
+    #     cb = fig.colorbar(hb, ax=ax, pad=0.01)
+    #     cb.set_label('PDF (a.u.)')
+    #     hb.set_clim(5.0, 35.0)
+    #     fig.savefig(self.save_dir / '02B_qr_pdf_aibm.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+
     def fig_02_qr_pdf(self):
+        """
+        Fig. 2 — Joint-PDF of (q, r) using hexbin with per-sample weights (1/N) and sum reduce.
+        The hex colour encodes the PMF scaled to counts-per-bin so the colour limits match 5–35.
+        Zero-mass bins are transparent. Both panels use identical clim for fair comparison.
+        """
+
         self._prepare()
-        q, r = self.q_np, self.r_np
+        q = np.asarray(self.q_np, dtype=np.float64)
+        r = np.asarray(self.r_np, dtype=np.float64)
+        N = q.size
 
-        # DNS
-        fig, ax = plt.subplots(figsize=(6.6, 5.6))
-        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
-        qv, rp, rm = self._vieillefosse(q.min(), q.max())
-        ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
-        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('DNS: joint PDF in $(q,r)$')
-        ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
-        ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
-        cb = fig.colorbar(hb, ax=ax, pad=0.01)
-        cb.set_label('PDF (a.u.)')
-        hb.set_clim(5.0, 35.0)
-        fig.savefig(self.save_dir / '02A_qr_pdf_dns.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+        # --- helper: build a hexbin whose array is PMF (probability mass per bin) ---
+        def hexbin_pmf(ax, r, q, gridsize=300, mincnt=1):
+            # Each sample carries weight 1/N; hexbin sums weights within each cell.
+            w = np.full(N, 1.0 / N, dtype=np.float64)
+            hb = ax.hexbin(
+                r, q,
+                C=w,
+                reduce_C_function=np.sum,  # sum weights in each bin -> PMF
+                gridsize=gridsize,
+                mincnt=mincnt,
+                linewidths=0.0,
+                cmap="jet"
+            )
+            # Convert to masked array: hide zero-mass (empty) bins so background is transparent
+            arr = hb.get_array().astype(np.float64)
+            pmf = np.ma.masked_less_equal(arr, 0.0)
+            pdf = pmf * float(N)  # scale to counts-per-bin to match requested colour limits
+            hb.set_array(pdf)
+            return hb, pdf
 
-        # AIBM (same (q,r) cloud; still shown separately)
-        fig, ax = plt.subplots(figsize=(6.6, 5.6))
-        hb = self._hexbin_mean(ax, r, q, c=None, gridsize=200, vmin=5.0, vmax=35.0)
-        qv, rp, rm = self._vieillefosse(q.min(), q.max())
-        ax.plot(rp, qv, 'k--', lw=1.1, label='Vieillefosse'); ax.plot(rm, qv, 'k--', lw=1.1)
-        ax.set_xlabel(r'$r$'); ax.set_ylabel(r'$q$'); ax.set_title('AIBM: joint PDF in $(q,r)$')
-        ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
-        ax.grid(True, ls=':', alpha=0.45); ax.legend(loc='upper left')
-        cb = fig.colorbar(hb, ax=ax, pad=0.01)
-        cb.set_label('PDF (a.u.)')
-        hb.set_clim(5.0, 35.0)
-        fig.savefig(self.save_dir / '02B_qr_pdf_aibm.png', dpi=self.DPI, bbox_inches='tight'); plt.close(fig)
+        # --- first pass: build both hexbins to collect PMF arrays (without saving) ---
+        figA, axA = plt.subplots(figsize=(6.6, 5.6))
+        hbA, _ = hexbin_pmf(axA, r, q, gridsize=300, mincnt=2)
+
+        figB, axB = plt.subplots(figsize=(6.6, 5.6))
+        hbB, _ = hexbin_pmf(axB, r, q, gridsize=300, mincnt=2)
+
+        # Fixed colour scaling per user request
+        vmin, vmax = 5.0, 35.0
+        norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+
+        # --- decorate + save: DNS panel ---
+        for ax, hb, title in (
+            (axA, hbA, r"DNS: joint PDF in $(q,r)$"),
+        ):
+            hb.set_norm(norm)
+            hb.set_clim(vmin, vmax)
+            qv, rp, rm = self._vieillefosse(float(q.min()), float(q.max()))
+            ax.plot(rp, qv, "k--", lw=1.5, label="Vieillefosse"); ax.plot(rm, qv, "k--", lw=1.1)
+            ax.set_xlabel(r"$r$"); ax.set_ylabel(r"$q$")
+            ax.set_title(title)
+            ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
+            ax.grid(True, ls=":", alpha=0.45); ax.legend(loc="upper left")
+            cb = figA.colorbar(hb, ax=ax, pad=0.01)
+            cb.set_label("PDF (per bin)")
+            cb.set_ticks([5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0])
+        figA.savefig(self.save_dir / "02A_qr_pdf_dns.png", dpi=self.DPI, bbox_inches="tight"); plt.close(figA)
+
+        # --- decorate + save: AIBM panel (same cloud, same clim) ---
+        for ax, hb, title in (
+            (axB, hbB, r"AIBM: joint PDF in $(q,r)$"),
+        ):
+            hb.set_norm(norm)
+            hb.set_clim(vmin, vmax)
+            qv, rp, rm = self._vieillefosse(float(q.min()), float(q.max()))
+            ax.plot(rp, qv, "k--", lw=1.5, label="Vieillefosse"); ax.plot(rm, qv, "k--", lw=1.1)
+            ax.set_xlabel(r"$r$"); ax.set_ylabel(r"$q$")
+            ax.set_title(title)
+            ax.set_xlim(-0.2, 0.2); ax.set_ylim(-0.5, 0.5)
+            ax.grid(True, ls=":", alpha=0.45); ax.legend(loc="upper left")
+            cb = figB.colorbar(hb, ax=ax, pad=0.01)
+            cb.set_label("PDF (per bin)")
+            cb.set_ticks([5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0])
+        figB.savefig(self.save_dir / "02B_qr_pdf_aibm.png", dpi=self.DPI, bbox_inches="tight"); plt.close(figB)
 
     # ------------------------------------------------------------------ #
     # 3) Rotation-invariance (A: DNS, B: overlay)
@@ -1851,7 +1948,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=400, help="Number of epochs to train for.")
     parser.add_argument('--learning-rate-q', type=float, default=1e-3, dest='learning_rate_q', help="Learning rate for the Q-direction model.")
     parser.add_argument('--learning-rate-psi', type=float, default=5e-3, dest='learning_rate_psi', help="Learning rate for the ψ-magnitude model.")
-    parser.add_argument('--grad-clip', type=float, default=100.0, dest='grad_clip', help="Gradient clipping value.")
+    parser.add_argument('--grad-clip', type=float, default=1000.0, dest='grad_clip', help="Gradient clipping value.")
     parser.add_argument('--symm-loss-weight', type=float, default=1.0, dest='symm_loss_weight', help="Weight for symmetry penalty encouraging P̂ to remain symmetric.")
     parser.add_argument('--ema-smoothing', type=float, default=0.15, dest='ema_smoothing', help="EMA smoothing factor for history plots.")
     parser.add_argument('--log-header-interval', type=int, default=25, help="How often (in printed lines) to re-print the log header.")
@@ -1877,17 +1974,17 @@ if __name__ == '__main__':
                         help="Weight decay coefficient for the Q-direction optimizer.")
     parser.add_argument('--weight-decay-psi', type=float, default=0.01,
                         help="Weight decay coefficient for the ψ optimizer.")
-    parser.add_argument('--beta1-q', type=float, default=0.9,
+    parser.add_argument('--beta1-q', type=float, default=0.95,
                         help="β₁ for the Q-direction optimizer.")
     parser.add_argument('--beta2-q', type=float, default=0.999,
                         help="β₂ for the Q-direction optimizer.")
-    parser.add_argument('--beta1-psi', type=float, default=0.9,
+    parser.add_argument('--beta1-psi', type=float, default=0.95,
                         help="β₁ for the ψ optimizer.")
     parser.add_argument('--beta2-psi', type=float, default=0.999,
                         help="β₂ for the ψ optimizer.")
-    parser.add_argument('--nadam-momentum-decay-q', type=float, default=0.004,
+    parser.add_argument('--nadam-momentum-decay-q', type=float, default=0.01,
                         help="Momentum decay for NAdam when used on the Q-direction model.")
-    parser.add_argument('--nadam-momentum-decay-psi', type=float, default=0.004,
+    parser.add_argument('--nadam-momentum-decay-psi', type=float, default=0.01,
                         help="Momentum decay for NAdam when used on the ψ model.")
     parser.add_argument('--chained-div-factor', type=float, default=25.0,
                         help="Divisor applied to max_lr to obtain the chained scheduler base LR.")
