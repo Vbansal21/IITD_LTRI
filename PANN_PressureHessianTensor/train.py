@@ -14,6 +14,7 @@ import os
 import argparse
 import glob
 import collections
+import copy
 from pathlib import Path
 from typing import Optional
 import matplotlib as mpl
@@ -23,7 +24,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless-safe backend for servers/CI
 
 plt.rcParams.update({
-    "savefig.dpi": 600,
+    "savefig.dpi": 2160,
     "figure.autolayout": True,
     "font.size": 13,
     "text.usetex": False,           # use MathText, avoid external LaTeX
@@ -106,35 +107,6 @@ def compute_tbnn_invariants_and_bases(s_input, w_input):
     T10 = torch.matmul(ws2, w_sq) - torch.matmul(w_sq, s2w)
     tensor_bases = torch.stack([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], dim=1)
     return invariants, tensor_bases
-
-class Shakeout(nn.Module):
-    """
-    Shakeout regularisation (generalised dropout) that replaces dropped units with
-    ±alpha noise instead of zeros. See: Zhang & Xie, "Shakeout: A New Regularized
-    Deep Neural Network Training Scheme".
-    """
-    def __init__(self, p: float = 0.5, alpha: float = 0.0):
-        super().__init__()
-        if not 0.0 <= p <= 1.0:
-            raise ValueError("Shakeout drop probability p must be in [0, 1].")
-        self.p = p
-        self.alpha = alpha
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p == 0.0:
-            return input
-        device = input.device
-        keep_prob = 1.0 - self.p
-        keep_mask = torch.empty_like(input, device=device).bernoulli_(keep_prob)
-        drop_mask = 1.0 - keep_mask
-        if self.alpha == 0.0:
-            noise = torch.zeros_like(input, device=device)
-        else:
-            noise = torch.empty_like(input, device=device).bernoulli_(0.5).mul_(2.0).sub_(1.0) * self.alpha
-        out = keep_mask * input + drop_mask * noise
-        if keep_prob > 0.0:
-            out = out / keep_prob
-        return out
 
 def ema(arr, alpha=0.15):
     arr = np.asarray(arr, dtype=np.float64)
@@ -274,25 +246,29 @@ class MatlabDataset(torch.utils.data.Dataset):
 
 class TBNN_Q_direction(nn.Module):
     def __init__(self, hidden_layers=[50, 100, 100, 100, 50], dropout_p=0.1,
-                 dropout_type: str = 'dropout', shakeout_alpha: float = 0.0):
+                 use_batch_norm: bool = True, init_weights: bool = True):
         super().__init__()
         input_dim = 5
         self.linears = nn.ModuleList()
         self.bns = nn.ModuleList()
+        self.use_batch_norm = bool(use_batch_norm)
+        self.apply_custom_init = bool(init_weights)
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.05))
+            if self.use_batch_norm:
+                bn_layer = nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.1)
+            else:
+                bn_layer = nn.Identity()
+            self.bns.append(bn_layer)
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 10)
         self.activation = nn.LeakyReLU(0.1)
-        drop_kind = (dropout_type or 'dropout').strip().lower()
         if dropout_p <= 0.0:
             self.dropout = nn.Identity()
-        elif drop_kind == 'shakeout':
-            self.dropout = Shakeout(dropout_p, shakeout_alpha)
         else:
             self.dropout = nn.Dropout(dropout_p)
-        self._init_weights()
+        if self.apply_custom_init:
+            self._init_weights()
 
     def forward(self, s, w, invariants=None, tensor_bases=None, return_penalty: bool = False):
         if invariants is None or tensor_bases is None:
@@ -300,10 +276,10 @@ class TBNN_Q_direction(nn.Module):
         x = invariants
         for linear, bn in zip(self.linears, self.bns):
             x = linear(x)
+            x = self.dropout(x)
             x = self.activation(x)
             x = bn(x)
-            x = self.dropout(x)
-        g = self.output_layer(x)
+        g = self.activation(self.output_layer(x))
         Q_hat_raw = torch.einsum('bn,bnij->bij', g, tensor_bases)
 
         sym_penalty = None
@@ -330,35 +306,39 @@ class TBNN_Q_direction(nn.Module):
 
 class FCNN_psi_magnitude(nn.Module):
     def __init__(self, hidden_layers=[50, 80, 50], dropout_p=0.1,
-                 dropout_type: str = 'dropout', shakeout_alpha: float = 0.0):
+                 use_batch_norm: bool = True, init_weights: bool = True):
         super().__init__()
         input_dim = 2
         self.linears = nn.ModuleList()
         self.bns = nn.ModuleList()
+        self.use_batch_norm = bool(use_batch_norm)
+        self.apply_custom_init = bool(init_weights)
         for hidden_dim in hidden_layers:
             self.linears.append(nn.Linear(input_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.05))
+            if self.use_batch_norm:
+                bn_layer = nn.BatchNorm1d(hidden_dim, eps=1e-8, momentum=0.1)
+            else:
+                bn_layer = nn.Identity()
+            self.bns.append(bn_layer)
             input_dim = hidden_dim
         self.output_layer = nn.Linear(input_dim, 1)
         self.activation = nn.LeakyReLU(0.1)
-        drop_kind = (dropout_type or 'dropout').strip().lower()
         if dropout_p <= 0.0:
             self.dropout = nn.Identity()
-        elif drop_kind == 'shakeout':
-            self.dropout = Shakeout(dropout_p, shakeout_alpha)
         else:
             self.dropout = nn.Dropout(dropout_p)
-        self._init_weights()
+        if self.apply_custom_init:
+            self._init_weights()
 
     def forward(self, q, r):
         inputs = torch.stack([q, r], dim=1)
         x = inputs
         for linear, bn in zip(self.linears, self.bns):
             x = linear(x)
+            x = self.dropout(x)
             x = self.activation(x)
             x = bn(x)
-            x = self.dropout(x)
-        return self.output_layer(x).squeeze()
+        return self.activation(self.output_layer(x)).squeeze()
 
     def _init_weights(self):
         for linear in self.linears:
@@ -612,7 +592,19 @@ class AIBMTrainer:
         self.history = []
         self.train_metrics = []
         self.val_metrics = []
-        self.best = {}
+        self.best_model_records = {
+            'Q': {'metric': float('inf'), 'epoch': None},
+            'psi': {'metric': float('inf'), 'epoch': None}
+        }
+        self.best_states = {
+            'model_Q': None,
+            'optimizer_Q': None,
+            'model_psi': None,
+            'optimizer_psi': None
+        }
+        self.best_summary = {}
+        self.best_snapshot_path = None
+        self.last_snapshot_path = None
         self.snapshot_dir = str(snapshot_dir) if snapshot_dir else None
         self.dropout_p = float(dropout_p)
         self._set_model_dropout(self.dropout_p)
@@ -700,19 +692,63 @@ class AIBMTrainer:
                 self._last_log_time = now
 
             # ---------- Best tracking / snapshots ----------
-            best_val_euler = self.best.get('euler', float('inf'))
-            current_val_euler = val_stats['euler']
-            if not math.isnan(current_val_euler) and current_val_euler < best_val_euler:
-                self.best = {'epoch': epoch_idx, **val_stats}
+            current_val_euler = val_stats.get('euler', float('nan'))
+            current_val_psi = val_stats.get('psi_rmse', float('nan'))
+
+            update_Q = math.isfinite(current_val_euler) and current_val_euler < self.best_model_records['Q']['metric']
+            update_psi = math.isfinite(current_val_psi) and current_val_psi < self.best_model_records['psi']['metric']
+
+            if update_Q:
+                self.best_model_records['Q'] = {'metric': float(current_val_euler), 'epoch': epoch_idx}
+                self.best_states['model_Q'] = copy.deepcopy(self.model_Q.state_dict())
+                self.best_states['optimizer_Q'] = copy.deepcopy(self.optimizer_Q.state_dict())
+
+            if update_psi:
+                self.best_model_records['psi'] = {'metric': float(current_val_psi), 'epoch': epoch_idx}
+                self.best_states['model_psi'] = copy.deepcopy(self.model_psi.state_dict())
+                self.best_states['optimizer_psi'] = copy.deepcopy(self.optimizer_psi.state_dict())
+
+            if update_Q or update_psi:
+                if self.best_states['model_Q'] is None:
+                    self.best_states['model_Q'] = copy.deepcopy(self.model_Q.state_dict())
+                    self.best_states['optimizer_Q'] = copy.deepcopy(self.optimizer_Q.state_dict())
+                if self.best_states['model_psi'] is None:
+                    self.best_states['model_psi'] = copy.deepcopy(self.model_psi.state_dict())
+                    self.best_states['optimizer_psi'] = copy.deepcopy(self.optimizer_psi.state_dict())
+
+                best_payload = {
+                    'best_Q_epoch': self.best_model_records['Q']['epoch'],
+                    'best_Q_euler': self.best_model_records['Q']['metric'],
+                    'best_psi_epoch': self.best_model_records['psi']['epoch'],
+                    'best_psi_rmse': self.best_model_records['psi']['metric'],
+                    'updated_at_epoch': epoch_idx,
+                    'val_metrics': val_stats
+                }
+                self.best_summary = best_payload
                 if self.snapshot_dir:
-                    self.save_snapshot(epoch_idx, val_stats, save_dir=self.snapshot_dir, tag='best')
+                    self.best_snapshot_path = self.save_snapshot(
+                        epoch_idx,
+                        best_payload,
+                        save_dir=self.snapshot_dir,
+                        tag='best',
+                        model_state_Q=self.best_states['model_Q'],
+                        model_state_psi=self.best_states['model_psi'],
+                        optimizer_state_Q=self.best_states['optimizer_Q'],
+                        optimizer_state_psi=self.best_states['optimizer_psi']
+                    )
+
             # Save rolling last snapshot
             if self.snapshot_dir:
-                self.save_snapshot(epoch_idx, val_stats, save_dir=self.snapshot_dir, tag='last')
+                self.last_snapshot_path = self.save_snapshot(
+                    epoch_idx,
+                    val_stats,
+                    save_dir=self.snapshot_dir,
+                    tag='last'
+                )
 
-        if self.best:
-            print("\nBest validation metrics (by Euler loss):")
-            print(self.best)
+        if self.best_summary:
+            print("\nBest validation metrics (per-model):")
+            print(self.best_summary)
 
         if self.enable_profiler:
             train_profiles = [m.get('profile_total') for m in self.train_metrics if isinstance(m.get('profile_total'), (int, float))]
@@ -735,6 +771,8 @@ class AIBMTrainer:
         self.history_df = pd.DataFrame(self.history)
         if self.metrics_save_path:
             self.history_df.to_csv(self.metrics_save_path, index=False)
+        if self.snapshot_dir:
+            self._cleanup_snapshots()
 
     @staticmethod
     def _format_sci(value):
@@ -762,10 +800,10 @@ class AIBMTrainer:
     def _set_model_dropout(self, p: float):
         p = float(np.clip(p, 0.0, 1.0))
         for module in self.model_Q.modules():
-            if isinstance(module, (nn.Dropout, Shakeout)):
+            if isinstance(module, nn.Dropout):
                 module.p = p
         for module in self.model_psi.modules():
-            if isinstance(module, (nn.Dropout, Shakeout)):
+            if isinstance(module, nn.Dropout):
                 module.p = p
         self.dropout_p = p
 
@@ -1074,21 +1112,47 @@ class AIBMTrainer:
             fig.savefig(out_path, dpi=300)
         plt.close(fig)
 
-    def save_snapshot(self, epoch, val_metrics, save_dir, tag=None):
-        os.makedirs(save_dir, exist_ok=True)
+    def save_snapshot(
+        self,
+        epoch,
+        val_metrics,
+        save_dir,
+        tag=None,
+        model_state_Q=None,
+        model_state_psi=None,
+        optimizer_state_Q=None,
+        optimizer_state_psi=None
+    ):
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
         state = {
             'epoch': epoch,
-            'model_Q': self.model_Q.state_dict(),
-            'model_psi': self.model_psi.state_dict(),
-            'optimizer_Q': self.optimizer_Q.state_dict(),
-            'optimizer_psi': self.optimizer_psi.state_dict(),
+            'model_Q': model_state_Q if model_state_Q is not None else self.model_Q.state_dict(),
+            'model_psi': model_state_psi if model_state_psi is not None else self.model_psi.state_dict(),
+            'optimizer_Q': optimizer_state_Q if optimizer_state_Q is not None else self.optimizer_Q.state_dict(),
+            'optimizer_psi': optimizer_state_psi if optimizer_state_psi is not None else self.optimizer_psi.state_dict(),
             'val_metrics': val_metrics
         }
         fname = f"snapshot_epoch{epoch:03d}"
         if tag:
             fname += f"_{tag}"
         fname += ".pt"
-        torch.save(state, os.path.join(save_dir, fname))
+        out_path = save_path / fname
+        torch.save(state, out_path)
+        return str(out_path)
+
+    def _cleanup_snapshots(self):
+        if not self.snapshot_dir:
+            return
+        snapshot_root = Path(self.snapshot_dir)
+        keep_candidates = {self.best_snapshot_path, self.last_snapshot_path}
+        keep_paths = {Path(p).resolve() for p in keep_candidates if p}
+        for snapshot_file in snapshot_root.glob("snapshot_epoch*.pt"):
+            try:
+                if snapshot_file.resolve() not in keep_paths:
+                    snapshot_file.unlink()
+            except OSError as err:
+                warnings.warn(f"Unable to delete snapshot '{snapshot_file}': {err}", stacklevel=2)
 
     @staticmethod
     def _normalise_state_dict(state_dict):
@@ -1137,10 +1201,18 @@ def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, ep
         lr_sched = trial.suggest_categorical('lr_scheduler', ['linear', 'cosine', 'warmup_cosine', 'none'])
         warmup = trial.suggest_float('scheduler_warmup', 0.0, 0.5)
 
-        drop_kind = getattr(base_args, 'dropout_type', 'dropout')
-        shake_alpha = getattr(base_args, 'shakeout_alpha', 0.0)
-        model_Q = TBNN_Q_direction(dropout_p=dropout, dropout_type=drop_kind, shakeout_alpha=shake_alpha).to(device, dtype=torch.float32)
-        model_psi = FCNN_psi_magnitude(dropout_p=dropout, dropout_type=drop_kind, shakeout_alpha=shake_alpha).to(device, dtype=torch.float32)
+        use_bn = not getattr(base_args, 'disable_batch_norm', False)
+        apply_init = not getattr(base_args, 'disable_custom_init', False)
+        model_Q = TBNN_Q_direction(
+            dropout_p=dropout,
+            use_batch_norm=use_bn,
+            init_weights=apply_init
+        ).to(device, dtype=torch.float32)
+        model_psi = FCNN_psi_magnitude(
+            dropout_p=dropout,
+            use_batch_norm=use_bn,
+            init_weights=apply_init
+        ).to(device, dtype=torch.float32)
 
         trainer = AIBMTrainer(
             model_Q=model_Q,
@@ -1181,7 +1253,7 @@ def run_bayesian_optimization(train_loader, val_loader, base_args, trials=10, ep
         )
 
         trainer.train(epochs=epochs_per_trial)
-        return trainer.best.get('euler', float('inf'))
+        return trainer.best_model_records['Q']['metric']
 
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=trials, show_progress_bar=False)
@@ -1346,7 +1418,7 @@ class AIBMVisualizer:
         rv = np.sqrt(np.maximum(-(4.0/27.0) * (qv ** 3), 0.0))
         return qv, +rv, -rv
 
-    def _hexbin_mean(self, ax, x, y, c=None, gridsize=220, cmap='jet', vmin=0.0, vmax=2.0):
+    def _hexbin_mean(self, ax, x, y, c=None, gridsize=275, cmap='jet', vmin=0.0, vmax=2.0):
         hex_kwargs = dict(
             gridsize=gridsize,
             cmap=cmap,
@@ -1482,7 +1554,7 @@ class AIBMVisualizer:
         N = q.size
 
         # --- helper: build a hexbin whose array is PMF (probability mass per bin) ---
-        def hexbin_pmf(ax, r, q, gridsize=300, mincnt=1):
+        def hexbin_pmf(ax, r, q, gridsize=275, mincnt=1):
             # Each sample carries weight 1/N; hexbin sums weights within each cell.
             w = np.full(N, 1.0 / N, dtype=np.float64)
             hb = ax.hexbin(
@@ -1503,10 +1575,10 @@ class AIBMVisualizer:
 
         # --- first pass: build both hexbins to collect PMF arrays (without saving) ---
         figA, axA = plt.subplots(figsize=(6.6, 5.6))
-        hbA, _ = hexbin_pmf(axA, r, q, gridsize=300, mincnt=2)
+        hbA, _ = hexbin_pmf(axA, r, q, gridsize=275, mincnt=2)
 
         figB, axB = plt.subplots(figsize=(6.6, 5.6))
-        hbB, _ = hexbin_pmf(axB, r, q, gridsize=300, mincnt=2)
+        hbB, _ = hexbin_pmf(axB, r, q, gridsize=275, mincnt=2)
 
         # Fixed colour scaling per user request
         vmin, vmax = 5.0, 35.0
@@ -1962,33 +2034,33 @@ if __name__ == '__main__':
     parser.add_argument('--compile-models', action='store_true',
                         help="Enable torch.compile on the neural networks for potential fused kernels.")
     parser.add_argument('--dropout', type=float, default=0.1, help="Dropout probability applied uniformly across the networks.")
-    parser.add_argument('--dropout-type', type=str, default='dropout', choices=['dropout', 'shakeout'],
-                        help="Use standard dropout or shakeout regularisation in the MLP blocks.")
-    parser.add_argument('--shakeout-alpha', type=float, default=0.0,
-                        help="Noise magnitude for shakeout; ignored when --dropout-type=dropout.")
+    parser.add_argument('--disable-batch-norm', action='store_true',
+                        help="Disable batch normalisation layers inside the MLP blocks.")
+    parser.add_argument('--disable-custom-init', action='store_true',
+                        help="Skip custom weight initialisation (use PyTorch defaults).")
     parser.add_argument('--optimizer-q', type=str, default='adamax', choices=['adamax', 'nadam'],
                         help="Optimizer for the Q-direction network (adamax or nadam).")
     parser.add_argument('--optimizer-psi', type=str, default='adamax', choices=['adamax', 'nadam'],
                         help="Optimizer for the ψ-magnitude network (adamax or nadam).")
-    parser.add_argument('--weight-decay-q', type=float, default=0.01,
+    parser.add_argument('--weight-decay-q', type=float, default=0.001,
                         help="Weight decay coefficient for the Q-direction optimizer.")
-    parser.add_argument('--weight-decay-psi', type=float, default=0.01,
+    parser.add_argument('--weight-decay-psi', type=float, default=0.001,
                         help="Weight decay coefficient for the ψ optimizer.")
-    parser.add_argument('--beta1-q', type=float, default=0.95,
+    parser.add_argument('--beta1-q', type=float, default=0.8,
                         help="β₁ for the Q-direction optimizer.")
-    parser.add_argument('--beta2-q', type=float, default=0.999,
+    parser.add_argument('--beta2-q', type=float, default=0.95,
                         help="β₂ for the Q-direction optimizer.")
-    parser.add_argument('--beta1-psi', type=float, default=0.95,
+    parser.add_argument('--beta1-psi', type=float, default=0.8,
                         help="β₁ for the ψ optimizer.")
-    parser.add_argument('--beta2-psi', type=float, default=0.999,
+    parser.add_argument('--beta2-psi', type=float, default=0.95,
                         help="β₂ for the ψ optimizer.")
-    parser.add_argument('--nadam-momentum-decay-q', type=float, default=0.01,
+    parser.add_argument('--nadam-momentum-decay-q', type=float, default=0.001,
                         help="Momentum decay for NAdam when used on the Q-direction model.")
-    parser.add_argument('--nadam-momentum-decay-psi', type=float, default=0.01,
+    parser.add_argument('--nadam-momentum-decay-psi', type=float, default=0.001,
                         help="Momentum decay for NAdam when used on the ψ model.")
     parser.add_argument('--chained-div-factor', type=float, default=25.0,
                         help="Divisor applied to max_lr to obtain the chained scheduler base LR.")
-    parser.add_argument('--chained-final-div-factor', type=float, default=10000.0,
+    parser.add_argument('--chained-final-div-factor', type=float, default=25000.0,
                         help="Divisor applied to max_lr to obtain the chained scheduler minimum LR during decay.")
     parser.add_argument('--chained-three-phase', action='store_true',
                         help="Include a cosine annealing phase between warmup and exponential decay in the chained scheduler.")
@@ -2004,6 +2076,8 @@ if __name__ == '__main__':
     parser.add_argument('--bayes-opt-epochs', type=int, default=50, dest='bayes_opt_epochs',
                         help="Epochs per Bayesian optimisation trial.")
     args = parser.parse_args()
+    use_batch_norm = not args.disable_batch_norm
+    apply_custom_init = not args.disable_custom_init
 
     # -------- Set up RUN_DIR --------
     figs_root = pathlib.Path('figs')
@@ -2065,11 +2139,11 @@ if __name__ == '__main__':
             print(f"Bayesian optimisation failed: {opt_generic}")
 
     model_Q = TBNN_Q_direction(dropout_p=args.dropout,
-                               dropout_type=args.dropout_type,
-                               shakeout_alpha=args.shakeout_alpha)
+                               use_batch_norm=use_batch_norm,
+                               init_weights=apply_custom_init)
     model_psi = FCNN_psi_magnitude(dropout_p=args.dropout,
-                                   dropout_type=args.dropout_type,
-                                   shakeout_alpha=args.shakeout_alpha)
+                                   use_batch_norm=use_batch_norm,
+                                   init_weights=apply_custom_init)
 
     metrics_path = str(RUN_DIR / 'metrics.csv') if args.train else None
     trainer = AIBMTrainer(
